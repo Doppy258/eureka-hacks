@@ -61,7 +61,14 @@
 .studio-root h1 {
   max-width: 10ch;
   font-size: clamp(3.75rem, 10vw, 8.5rem);
-  line-height: 0.84;
+  /* line-height was 0.84, which clipped descenders ("g", "p", "y") into the
+     paragraph below at this font size. 0.95 keeps the tight editorial feel
+     while leaving room for descenders inside the line box. */
+  line-height: 0.95;
+  /* Reserve space for descender overhang so the rendered glyphs never bleed
+     into the next sibling's margin even when text-wrap balance pushes long
+     lines into the bottom row. */
+  padding-bottom: 0.12em;
 }
 
 .studio-root h2 {
@@ -166,7 +173,9 @@
 
 .nw-lede {
   max-width: 42rem;
-  margin-top: 1.35rem;
+  /* Bumped from 1.35rem so the lede always clears the h1's descenders even
+     when the headline wraps to many lines on narrow viewports. */
+  margin-top: clamp(1.5rem, 2.4vw, 2.2rem);
   color: var(--nw-text);
   font-size: clamp(1rem, 1.8vw, 1.28rem);
   line-height: 1.6;
