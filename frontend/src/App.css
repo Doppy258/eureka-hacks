@@ -1,3 +1,16 @@
+.studio-back {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+}
+
+.studio-back a {
+  text-decoration: none;
+}
+
+.studio-back a:hover {
+  text-decoration: underline;
+}
+
 .app-header {
   margin-bottom: 1.75rem;
 }

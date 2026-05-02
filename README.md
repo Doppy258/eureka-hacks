@@ -1,6 +1,6 @@
 # TRIBE Studio
 
-Web app: upload a video, run [TRIBE v2](https://huggingface.co/facebook/tribev2) (when installed), view a timeline of coarse predicted cortical sectors, and optional heuristic feedback.
+Web app: the **landing** (marketing page) is served at `/`, and **TRIBE Studio** (upload, timeline, feedback) is at `/studio`. Upload a video, run [TRIBE v2](https://huggingface.co/facebook/tribev2) (when installed), view a timeline of coarse predicted cortical sectors, and optional heuristic feedback.
 
 ## Quick start (UI + demo timeline)
 
