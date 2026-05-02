@@ -31,12 +31,9 @@ Open `http://localhost:5173`. With `TRIBE_DEMO=1`, the API uses synthetic brain-
    cd backend && uvicorn main:app --host 0.0.0.0 --port 8000
    ```
 
-2. **Expose port 8000 to the internet** with a tunnel (pick one):
+2. **Expose port 8000 to the internet.** The supported path in this repo is **[ngrok](https://ngrok.com/)** (official agent): see [`notebooks/colab_tribe_backend.ipynb`](notebooks/colab_tribe_backend.ipynb) (cells **4b** + **5**) which installs ngrok via **apt** on Colab, runs `ngrok config add-authtoken …`, then `ngrok http 8000`, and prints `export REMOTE_TRIBE_URL="https://…/api/analyze"`.
 
-   - [ngrok](https://ngrok.com/) (`ngrok http 8000`) or  
-   - [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/) (`cloudflared tunnel --url http://127.0.0.1:8000`)
-
-   You need a public **HTTPS** URL that forwards to Colab’s `8000`. Copy the full analyze URL, e.g. `https://abcd-123.ngrok-free.app/api/analyze`.
+   Alternatively you can use [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/) (`cloudflared tunnel --url http://127.0.0.1:8000`) if you prefer; you still need an **HTTPS** URL ending in `/api/analyze` for the Mac backend.
 
 3. **On your Mac** (do **not** set `REMOTE_TRIBE_URL` inside Colab—that would loop). Only the Mac backend uses the tunnel:
 
@@ -60,11 +57,19 @@ The official **Colab** extension runs notebook code on **Colab GPUs**, but it st
 
 - Notebook: [`notebooks/colab_tribe_backend.ipynb`](notebooks/colab_tribe_backend.ipynb)
 
-1. Install the **Colab** extension, open that notebook from this repo, choose a **Colab GPU** kernel, run all cells.
-2. Enter **HF** and **ngrok** tokens when prompted; copy the `export REMOTE_TRIBE_URL=...` line to your Mac terminal.
+1. Install the **Colab** extension, open that notebook from this repo, choose a **Colab GPU** kernel, run all cells **in order** (through cell 5).
+2. Enter **HF** and **ngrok** authtoken when prompted (use [Your Authtoken](https://dashboard.ngrok.com/get-started/your-authtoken); **rotate** any token that was ever pasted into chat or committed to git).
 3. Edit `REPO_URL` in the notebook to your GitHub fork (or use the zip path described in the notebook).
 
 The Mac backend adds `ngrok-skip-browser-warning` automatically when the remote URL looks like ngrok, so forwarded uploads are less likely to hit the free-tier interstitial.
+
+### Ngrok helper (any machine where the agent runs)
+
+If `ngrok http 8000` is running locally, you can print the same export line from ngrok’s inspect API (`http://127.0.0.1:4040`):
+
+```bash
+python scripts/ngrok_print_analyze_url.py
+```
 
 ## Full TRIBE v2 inference
 
