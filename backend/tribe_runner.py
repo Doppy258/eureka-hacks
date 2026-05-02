@@ -1,17 +1,28 @@
-"""Run TRIBE v2 on a video path, or fall back to demo synthetic data."""
+"""Minimal TRIBE v2 adapter for NeuroWatch.
+
+This module intentionally keeps only the inference calls NeuroWatch needs:
+``TribeModel.from_pretrained``, ``get_events_dataframe(video_path=...)``, and
+``predict(events=...)``. Training, plotting, datasets, and notebooks stay out of
+this repository.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
 import subprocess
+import sys
 import typing as tp
+from typing import Optional
+from pathlib import Path
 
 import numpy as np
+import zlib
+import base64
 
 logger = logging.getLogger(__name__)
 
-_model_singleton: tp.Any | None = None
+_model_singleton: Optional[tp.Any] = None
 
 # Left / right hemisphere sectors on fsaverage5-style vertex layout (10242 + 10242 vertices).
 REGION_LABELS = [
@@ -26,7 +37,7 @@ REGION_LABELS = [
 ]
 
 
-def _video_duration_ffprobe(path: str) -> float | None:
+def _video_duration_ffprobe(path: str) -> Optional[float]:
     try:
         out = subprocess.check_output(
             [
@@ -45,6 +56,11 @@ def _video_duration_ffprobe(path: str) -> float | None:
         return float(out.decode().strip())
     except (FileNotFoundError, subprocess.CalledProcessError, ValueError, OSError):
         return None
+
+
+def video_duration_seconds(path: str) -> Optional[float]:
+    """Best-effort video duration for upload validation before heavy inference."""
+    return _video_duration_ffprobe(path)
 
 
 def _segment_times(all_segments: tp.Sequence[tp.Any]) -> tuple[np.ndarray, np.ndarray]:
@@ -128,19 +144,56 @@ def _get_tribe_model():
     global _model_singleton
     if _model_singleton is not None:
         return _model_singleton
-    from tribev2 import TribeModel  # type: ignore
+    try:
+        # Allow using the local Tribev2 checkout used in `new-test/tribev2`
+        repo_root = tp.cast("tp.Any", __file__)
+        try:
+            from pathlib import Path
 
-    cache = os.environ.get("TRIBE_CACHE", "./tribe_cache")
+            repo_root = Path(__file__).resolve().parents[1]
+            local_tribe = repo_root / "new-test" / "tribev2"
+            if local_tribe.exists() and str(local_tribe) not in sys.path:
+                sys.path.insert(0, str(local_tribe))
+        except Exception:
+            pass
+        from tribev2 import TribeModel  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "TRIBE v2 is not installed in this Python environment. For the lightweight app, run with "
+            "TRIBE_DEMO=1 locally or set REMOTE_TRIBE_URL to a Colab/GPU backend that has TRIBE installed."
+        ) from e
+
+    # Match the official TRIBE v2 quickstart default (`cache_folder="./cache"`).
+    # The launcher runs the backend with cwd = new-test/tribev2 so "./cache" resolves
+    # exactly like your standalone script and feature caches hit.
+    cache = os.environ.get("TRIBE_CACHE", "./cache")
     repo = os.environ.get("TRIBE_REPO", "facebook/tribev2")
     raw = os.environ.get("TRIBE_DEVICE", "auto")
     device = _resolve_torch_device(raw)
     if raw.lower() in ("auto", ""):
         logger.info("TRIBE_DEVICE=auto resolved to %s", device)
-    _model_singleton = TribeModel.from_pretrained(repo, cache_folder=cache, device=device)
+    # Critical for macOS + PyTorch DataLoader: avoid spawning workers that re-import __main__.
+    # Also override extractor device defaults from the training config (often "cuda").
+    # Feature extractors in this config only accept cpu/cuda/auto/accelerate (not mps).
+    import torch
+
+    feature_device = "cuda" if torch.cuda.is_available() else "cpu"
+    _model_singleton = TribeModel.from_pretrained(
+        repo,
+        cache_folder=cache,
+        device=device,
+        config_update={
+            "data.num_workers": 0,
+            "data.audio_feature.device": feature_device,
+            "data.image_feature.image.device": feature_device,
+            "data.text_feature.device": feature_device,
+            "data.video_feature.image.device": feature_device,
+        },
+    )
     return _model_singleton
 
 
-def run_tribe(video_path: str, cache_folder: str | None = None) -> dict[str, tp.Any]:
+def run_tribe(video_path: str, cache_folder: Optional[str] = None) -> dict[str, tp.Any]:
     """Load TribeModel and run predict; raises on failure."""
     if cache_folder:
         os.environ["TRIBE_CACHE"] = cache_folder
@@ -169,6 +222,128 @@ def run_tribe(video_path: str, cache_folder: str | None = None) -> dict[str, tp.
         "engagement": engagement.astype(float).tolist(),
         "region_labels": REGION_LABELS,
         "region_timeseries": region_ts.astype(float).tolist(),
+    }
+
+
+def run_tribe_vertices(
+    video_path: str,
+    *,
+    max_points: int = 2048,
+    seed: int = 0,
+) -> dict[str, tp.Any]:
+    """Return a lightweight point-cloud timeline for web visualization.
+
+    Output shape: activations[T][P], where P = max_points (downsampled vertices).
+    """
+    model = _get_tribe_model()
+    events = model.get_events_dataframe(video_path=video_path)
+    preds, all_segments = model.predict(events, verbose=False)
+    preds = np.asarray(preds, dtype=np.float32)  # (T, V)
+    starts, ends = _segment_times(all_segments)
+
+    t, v = preds.shape
+    p = int(min(max_points, v))
+    rng = np.random.default_rng(seed)
+    idx = np.linspace(0, v - 1, p, dtype=np.int64)
+    # Add a tiny shuffle for nicer spatial distribution while staying deterministic.
+    jitter = rng.permutation(p)
+    idx = idx[jitter]
+
+    down = preds[:, idx]  # (T, P)
+    # Normalize per-timestep for visualization (robust to global scale).
+    mu = down.mean(axis=1, keepdims=True)
+    sd = down.std(axis=1, keepdims=True) + 1e-6
+    z = (down - mu) / sd
+    z = np.clip(z, -3.0, 3.0).astype(np.float32)
+
+    # Deterministic “brain-ish” 2D projection: points on a sphere projected to 2D.
+    # This is intentionally lightweight (no fsaverage mesh download).
+    i = np.arange(p, dtype=np.float32)
+    phi = (np.sqrt(5.0) - 1.0) / 2.0  # golden ratio conjugate
+    theta = 2.0 * np.pi * (i * phi % 1.0)
+    y = 1.0 - (2.0 * i + 1.0) / p
+    r = np.sqrt(np.maximum(0.0, 1.0 - y * y))
+    x = r * np.cos(theta)
+    z3 = r * np.sin(theta)
+    # Simple camera projection
+    positions_2d = np.stack([x, y], axis=1).astype(np.float32)  # (P, 2)
+
+    duration = _video_duration_ffprobe(video_path)
+    if duration is None and ends.size:
+        duration = float(np.max(ends))
+    elif duration is None:
+        duration = float(starts[-1] + 1.5) if starts.size else 30.0
+
+    return {
+        "mode": "tribe",
+        "video_duration_sec": float(duration),
+        "tr_sec": float(np.median(np.diff(starts))) if starts.size > 1 else 1.5,
+        "timestamps_start": starts.astype(float).tolist(),
+        "timestamps_end": ends.astype(float).tolist(),
+        "point_count": int(p),
+        "positions_2d": positions_2d.round(5).tolist(),
+        "activations": z.round(5).tolist(),
+    }
+
+
+def encode_f32_zlib_base64(arr: np.ndarray) -> dict[str, tp.Any]:
+    """Encode a float32 array as base64(zlib(raw-bytes)).
+
+    Frontend contract:
+    - data_b64 decodes to zlib-compressed raw little-endian bytes (C-order).
+    - dtype is always 'float32'.
+    - shape is arr.shape.
+    """
+    a = np.asarray(arr, dtype=np.float32, order="C")
+    raw = a.tobytes(order="C")
+    comp = zlib.compress(raw, level=6)
+    return {
+        "dtype": "float32",
+        "shape": list(a.shape),
+        "compression": "zlib",
+        "data_b64": base64.b64encode(comp).decode("ascii"),
+    }
+
+
+def run_tribe_surface(
+    video_path: str,
+    *,
+    normalize_per_timestep: bool = True,
+    clip_z: float = 3.0,
+) -> dict[str, tp.Any]:
+    """Return full vertex activations for fsaverage5-style surfaces.
+
+    Output:
+    - timestamps_start/end, tr_sec, duration
+    - activations: base64(zlib(float32 bytes)) with shape (T, V)
+    """
+    model = _get_tribe_model()
+    events = model.get_events_dataframe(video_path=video_path)
+    preds, all_segments = model.predict(events, verbose=False)
+    preds = np.asarray(preds, dtype=np.float32)  # (T, V)
+    starts, ends = _segment_times(all_segments)
+
+    if normalize_per_timestep and preds.size:
+        mu = preds.mean(axis=1, keepdims=True)
+        sd = preds.std(axis=1, keepdims=True) + 1e-6
+        preds = (preds - mu) / sd
+        if clip_z is not None:
+            preds = np.clip(preds, -float(clip_z), float(clip_z))
+
+    duration = _video_duration_ffprobe(video_path)
+    if duration is None and ends.size:
+        duration = float(np.max(ends))
+    elif duration is None:
+        duration = float(starts[-1] + 1.5) if starts.size else 30.0
+
+    return {
+        "mode": "tribe",
+        "video_duration_sec": float(duration),
+        "tr_sec": float(np.median(np.diff(starts))) if starts.size > 1 else 1.5,
+        "timestamps_start": starts.astype(float).tolist(),
+        "timestamps_end": ends.astype(float).tolist(),
+        "vertex_count": int(preds.shape[1]),
+        "activations": encode_f32_zlib_base64(preds),
     }
 
 

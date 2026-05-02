@@ -1,22 +1,55 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 import {
+  Area,
+  AreaChart,
   CartesianGrid,
-  Line,
-  LineChart,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from 'recharts'
-import { Link } from 'react-router-dom'
+import { Activity, AlertTriangle, Brain, Clock, FileVideo, Flame, Scissors, Sparkles, Upload, Zap } from 'lucide-react'
 import './studio.css'
 import './App.css'
+
+type CreatorSegment = {
+  start: number
+  end: number
+  score?: number
+  reason?: string
+}
+
+type CreatorTimelinePoint = {
+  start: number
+  end: number
+  brain_score: number
+  label: 'stale' | 'high_engagement' | 'medium' | string
+}
+
+type CreatorReport = {
+  product_name: string
+  mode_label: string
+  overall_score: number
+  hook_score: number
+  retention_risk: number
+  peak_density: number
+  stale_segments: CreatorSegment[]
+  peak_segments: CreatorSegment[]
+  suggested_cut: CreatorSegment[]
+  suggestions: string[]
+  timeline: CreatorTimelinePoint[]
+  disclaimer: string
+}
 
 type AnalyzeResponse = {
   job_id: string
   video_url: string
   mode: string
+  inference_source?: string
   video_duration_sec: number
   tr_sec: number
   timestamps_start: number[]
@@ -29,302 +62,530 @@ type AnalyzeResponse = {
     negatives: string[]
     stimulation_tips: string[]
     disclaimer: string
+    creator_report?: CreatorReport
   } | null
   fallback_error?: string | null
 }
 
-function heatColor(value: number, vmin: number, vmax: number): string {
-  if (vmax <= vmin) return 'hsl(230,55%,45%)'
-  const t = (value - vmin) / (vmax - vmin)
-  const h = 255 - t * 95
-  const l = 28 + t * 42
-  return `hsl(${h}, 72%, ${l}%)`
+type ChartPoint = {
+  t: number
+  score: number
+  label: string
+}
+
+function formatTime(seconds: number): string {
+  const safe = Math.max(0, seconds)
+  const mins = Math.floor(safe / 60)
+  const secs = Math.floor(safe % 60)
+  return `${mins}:${secs.toString().padStart(2, '0')}`
+}
+
+function normalizeScores(values: number[]): number[] {
+  if (!values.length) return []
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  if (max <= min) return values.map(() => 50)
+  return values.map((value) => Math.round(((value - min) / (max - min)) * 1000) / 10)
+}
+
+function buildFallbackReport(result: AnalyzeResponse): CreatorReport {
+  const normalized = normalizeScores(result.engagement)
+  const timeline = result.timestamps_start.map((start, i) => {
+    const score = normalized[i] ?? 0
+    return {
+      start,
+      end: result.timestamps_end[i] ?? start + result.tr_sec,
+      brain_score: score,
+      label: score >= 75 ? 'high_engagement' : score <= 35 ? 'stale' : 'medium',
+    }
+  })
+  const sorted = [...timeline].sort((a, b) => b.brain_score - a.brain_score)
+  const peaks = sorted.slice(0, 3).map((point) => ({
+    start: Math.max(0, point.start - 0.5),
+    end: Math.min(result.video_duration_sec, point.end + 0.5),
+    score: point.brain_score,
+    reason: 'Highest local predicted response in the uploaded clip.',
+  }))
+  const stale = timeline
+    .filter((point) => point.label === 'stale')
+    .slice(0, 3)
+    .map((point) => ({
+      start: point.start,
+      end: point.end,
+      score: point.brain_score,
+      reason: 'Predicted response is low compared with the rest of the clip.',
+    }))
+  const hookPoints = timeline.filter((point) => point.start < 3)
+  const hookScore = hookPoints.length
+    ? hookPoints.reduce((sum, point) => sum + point.brain_score, 0) / hookPoints.length
+    : 0
+
+  return {
+    product_name: 'NeuroWatch',
+    mode_label: getModeLabel(result),
+    overall_score: Math.round((normalized.reduce((sum, value) => sum + value, 0) / Math.max(normalized.length, 1)) * 10) / 10,
+    hook_score: Math.round(hookScore * 10) / 10,
+    retention_risk: Math.round((stale.length / Math.max(timeline.length, 1)) * 1000) / 10,
+    peak_density: Math.round((peaks.length / Math.max(result.video_duration_sec / 10, 1)) * 10) / 10,
+    stale_segments: stale,
+    peak_segments: peaks,
+    suggested_cut: peaks.map((peak) => ({ start: peak.start, end: peak.end })),
+    suggestions: [
+      peaks[0]
+        ? `Open with or tease the strongest moment around ${formatTime(peaks[0].start)}.`
+        : 'Upload a clip with clear visual and audio changes for a stronger report.',
+      stale[0]
+        ? `Tighten ${formatTime(stale[0].start)}-${formatTime(stale[0].end)} or add a visual change there.`
+        : 'No obvious stale section was detected at this resolution.',
+      'Use this as a predicted editing signal, not a guarantee of real audience retention.',
+    ],
+    timeline,
+    disclaimer: result.feedback?.disclaimer ?? '',
+  }
+}
+
+function getModeLabel(result: AnalyzeResponse): string {
+  if (result.inference_source === 'remote') {
+    return result.mode === 'tribe' ? 'remote TRIBE v2' : 'remote demo-safe proxy'
+  }
+  if (result.inference_source === 'local') {
+    return result.mode === 'tribe' ? 'local TRIBE v2' : 'demo-safe proxy'
+  }
+  return result.mode === 'tribe' ? 'TRIBE v2' : 'demo-safe proxy'
+}
+
+function apiErrorMessage(body: string, fallback: string): string {
+  if (!body) return fallback
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown }
+    if (typeof parsed.detail === 'string') return parsed.detail
+    if (Array.isArray(parsed.detail)) return parsed.detail.map((item) => String(item?.msg ?? item)).join('; ')
+  } catch {
+    return body
+  }
+  return body
+}
+
+function scoreTone(score: number): string {
+  if (score >= 72) return 'strong'
+  if (score >= 45) return 'steady'
+  return 'risk'
 }
 
 export default function StudioApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const previewUrlRef = useRef<string | null>(null)
   const [file, setFile] = useState<File | null>(null)
-  const [includeFeedback, setIncludeFeedback] = useState(true)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<AnalyzeResponse | null>(null)
   const [playhead, setPlayhead] = useState(0)
 
-  const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0]
-    setFile(f ?? null)
+  useEffect(() => {
+    return () => {
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
+    }
+  }, [])
+
+  const report = useMemo(() => {
+    if (!result) return null
+    return result.feedback?.creator_report ?? buildFallbackReport(result)
+  }, [result])
+
+  const modeLabel = result ? report?.mode_label ?? getModeLabel(result) : 'ready'
+
+  const chartData = useMemo<ChartPoint[]>(() => {
+    if (!report) return []
+    return report.timeline.map((point) => ({
+      t: Math.round(((point.start + point.end) / 2) * 100) / 100,
+      score: point.brain_score,
+      label: point.label,
+    }))
+  }, [report])
+
+  const brainCells = useMemo(() => {
+    const points = report?.timeline ?? []
+    if (!points.length) {
+      return Array.from({ length: 24 }, (_, i) => ({ key: i, score: 18 + (i % 5) * 4 }))
+    }
+    return Array.from({ length: 24 }, (_, i) => {
+      const point = points[Math.floor((i / 24) * points.length)] ?? points[0]
+      return { key: i, score: point.brain_score }
+    })
+  }, [report])
+
+  const videoSrc = result?.video_url ?? previewUrl ?? undefined
+
+  const onFile = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = event.target.files?.[0] ?? null
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current)
+      previewUrlRef.current = null
+    }
+    setResult(null)
     setError(null)
+    setUploadProgress(0)
+    if (!selected) {
+      setFile(null)
+      setPreviewUrl(null)
+      return
+    }
+    const supported = ['video/mp4', 'video/quicktime', 'video/webm']
+    if (!supported.includes(selected.type) && !/\.(mp4|mov|webm)$/i.test(selected.name)) {
+      setFile(null)
+      setPreviewUrl(null)
+      setError('Upload an .mp4, .mov, or .webm file.')
+      return
+    }
+    const url = URL.createObjectURL(selected)
+    previewUrlRef.current = url
+    setFile(selected)
+    setPreviewUrl(url)
   }
+
+  const seekTo = useCallback((seconds: number) => {
+    const video = videoRef.current
+    if (!video) return
+    video.currentTime = Math.max(0, seconds)
+    video.play().catch(() => {})
+  }, [])
 
   const analyze = async () => {
     if (!file) {
-      setError('Choose a video file first.')
+      setError('Choose a video first.')
       return
     }
+
     setLoading(true)
+    setUploadProgress(0)
     setError(null)
     setResult(null)
+
+    const formData = new FormData()
+    formData.append('file', file)
+
     try {
-      const fd = new FormData()
-      fd.append('file', file)
-      const q = includeFeedback ? 'true' : 'false'
-      const res = await fetch(`/api/analyze?include_feedback=${q}`, {
-        method: 'POST',
-        body: fd,
+      const data = await new Promise<AnalyzeResponse>((resolve, reject) => {
+        const xhr = new XMLHttpRequest()
+        xhr.open('POST', '/api/analyze?include_feedback=true')
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) {
+            setUploadProgress(Math.round((event.loaded / event.total) * 100))
+          }
+        }
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(JSON.parse(xhr.responseText) as AnalyzeResponse)
+            return
+          }
+          reject(new Error(apiErrorMessage(xhr.responseText, xhr.statusText)))
+        }
+        xhr.onerror = () => reject(new Error('Connection failed. Is the FastAPI backend running on port 8000?'))
+        xhr.send(formData)
       })
-      if (!res.ok) {
-        const text = await res.text()
-        throw new Error(text || res.statusText)
-      }
-      const data = (await res.json()) as AnalyzeResponse
+      setUploadProgress(100)
       setResult(data)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Request failed')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Analysis failed.')
     } finally {
       setLoading(false)
     }
   }
 
-  const seekToMid = useCallback(
-    (i: number) => {
-      if (!result) return
-      const a = result.timestamps_start[i]
-      const b = result.timestamps_end[i]
-      const t = (a + b) / 2
-      const v = videoRef.current
-      if (v) {
-        v.currentTime = Math.min(Math.max(t, 0), result.video_duration_sec)
-        v.play().catch(() => {})
-      }
-    },
-    [result],
-  )
-
-  const onTimeUpdate = () => {
-    const v = videoRef.current
-    if (v) setPlayhead(v.currentTime)
-  }
-
-  const heatmapRows = useMemo(() => {
-    if (!result) {
-      return {
-        heatmapMin: 0,
-        heatmapMax: 1,
-        gridTemplateColumns: 'repeat(1, minmax(6px, 1fr))',
-        rows: [] as {
-          label: string
-          cells: { key: string; style: React.CSSProperties; ti: number }[]
-        }[],
-      }
-    }
-    const T = result.timestamps_start.length
-    const R = result.region_labels.length
-    const flat = result.region_timeseries.flat()
-    const heatmapMin = flat.length ? Math.min(...flat) : 0
-    const heatmapMax = flat.length ? Math.max(...flat) : 1
-    const gridTemplateColumns = `repeat(${Math.max(T, 1)}, minmax(5px, 1fr))`
-    const rows: {
-      label: string
-      cells: { key: string; style: React.CSSProperties; ti: number }[]
-    }[] = []
-    for (let ri = 0; ri < R; ri++) {
-      const cells: { key: string; style: React.CSSProperties; ti: number }[] = []
-      for (let ti = 0; ti < T; ti++) {
-        const v = result.region_timeseries[ti]?.[ri] ?? 0
-        cells.push({
-          key: `${ri}-${ti}`,
-          style: { backgroundColor: heatColor(v, heatmapMin, heatmapMax) },
-          ti,
-        })
-      }
-      rows.push({
-        label: result.region_labels[ri]?.replace(' (surface vertices)', '') ?? `R${ri}`,
-        cells,
-      })
-    }
-    return { heatmapMin, heatmapMax, gridTemplateColumns, rows }
-  }, [result])
-
-  const chartData = useMemo(() => {
-    if (!result) return []
-    return result.timestamps_start.map((t0, i) => ({
-      t: (t0 + result.timestamps_end[i]) / 2,
-      engagement: result.engagement[i] ?? 0,
-    }))
-  }, [result])
-
   return (
-    <div className="studio-root">
-      <header className="app-header">
-        <p className="studio-back">
-          <Link to="/">← Eureka Hacks</Link>
-        </p>
-        <h1>TRIBE Studio</h1>
-        <p className="lede">
-          Upload a short video to run Meta’s{' '}
-          <a href="https://huggingface.co/facebook/tribev2" target="_blank" rel="noreferrer">
-            TRIBE v2
-          </a>{' '}
-          encoding model (when installed), then explore predicted cortical drive over time and
-          optional edit-oriented notes.
-        </p>
-      </header>
+    <main className="studio-root">
+      <section className="nw-hero">
+        <nav className="nw-nav" aria-label="NeuroWatch navigation">
+          <Link to="/" className="nw-brand">
+            <span className="nw-brand-mark" aria-hidden="true">
+              <Brain size={18} />
+            </span>
+            NeuroWatch
+          </Link>
+          <a href="#dashboard" className="nw-nav-link">
+            dashboard
+          </a>
+        </nav>
 
-      <section className="panel">
-        <div className="upload-row">
-          <input className="file-input" type="file" accept="video/*" onChange={onFile} />
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={includeFeedback}
-              onChange={(e) => setIncludeFeedback(e.target.checked)}
-            />
-            Include feedback
-          </label>
-          <button type="button" className="btn" disabled={loading} onClick={analyze}>
-            {loading ? 'Running…' : 'Analyze video'}
-          </button>
+        <div className="nw-hero-grid">
+          <div>
+            <p className="nw-kicker">pre-upload brain-response debugger</p>
+            <h1>See where your content wakes the brain up, and where it goes stale.</h1>
+            <p className="nw-lede">
+              Upload a short video and get a creator report: hook score, stale sections, top moments,
+              a suggested 15-second cut, and timestamped edit notes.
+            </p>
+            <div className="nw-hero-actions">
+              <label className="nw-upload-button">
+                <Upload size={18} />
+                <span>{file ? file.name : 'Choose video'}</span>
+                <input type="file" accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm" onChange={onFile} />
+              </label>
+              <button type="button" className="nw-primary-button" disabled={loading} onClick={analyze}>
+                {loading ? 'Analyzing…' : 'Analyze video'}
+              </button>
+            </div>
+            <p className="nw-file-note">MVP supports .mp4, .mov, and .webm clips from 10 to 90 seconds.</p>
+          </div>
+
+          <BrainHeatmap cells={brainCells} score={report?.overall_score ?? 42} mode={modeLabel} />
         </div>
       </section>
 
-      {error ? <div className="error-banner">{error}</div> : null}
-
-      {result ? (
-        <>
-          <section className="panel">
-            <div className="meta-row">
-              <span className="badge">{result.mode === 'tribe' ? 'TRIBE v2' : 'Demo timeline'}</span>
-              <span>Duration ~{result.video_duration_sec.toFixed(1)}s</span>
-              <span>Bin ~{result.tr_sec.toFixed(2)}s</span>
-            </div>
-            {result.fallback_error ? (
-              <p style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>
-                Model unavailable; showing demo data.{' '}
-                <code style={{ fontSize: '0.8rem' }}>{result.fallback_error}</code>
-              </p>
-            ) : null}
-            <div className="video-wrap">
-              <video
-                ref={videoRef}
-                src={result.video_url}
-                controls
-                onTimeUpdate={onTimeUpdate}
-              />
-            </div>
-            <p className="section-title">Predicted response by cortical sector (coarse vertex groups)</p>
-            <div className="heatmap-wrap">
-              {heatmapRows.rows.map((row) => (
-                <div
-                  key={row.label}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'stretch',
-                    gap: '8px',
-                    marginBottom: '4px',
-                  }}
-                >
-                  <div
-                    className="row-label"
-                    style={{
-                      width: '128px',
-                      flexShrink: 0,
-                      fontSize: '0.68rem',
-                      lineHeight: 1.25,
-                      textAlign: 'right',
-                      paddingTop: '2px',
-                    }}
-                  >
-                    {row.label}
-                  </div>
-                  <div
-                    className="heatmap"
-                    style={{
-                      flex: 1,
-                      display: 'grid',
-                      gridTemplateColumns: heatmapRows.gridTemplateColumns,
-                      gap: '2px',
-                      minHeight: '18px',
-                    }}
-                  >
-                    {row.cells.map((c) => (
-                      <button
-                        type="button"
-                        key={c.key}
-                        className="heatmap-cell"
-                        style={c.style}
-                        title={`t≈${((result.timestamps_start[c.ti] + result.timestamps_end[c.ti]) / 2).toFixed(2)}s`}
-                        onClick={() => seekToMid(c.ti)}
-                      />
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <p className="section-title">Aggregate predicted drive (mean |vertices| per bin)</p>
-            <div className="chart-block">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" opacity={0.25} />
-                  <XAxis dataKey="t" tickFormatter={(v) => `${v}s`} fontSize={11} />
-                  <YAxis fontSize={11} width={36} />
-                  <Tooltip
-                    formatter={(val) => [
-                      typeof val === 'number' ? val.toFixed(4) : String(val ?? ''),
-                      'drive',
-                    ]}
-                    labelFormatter={(l) => `${Number(l).toFixed(2)}s`}
-                  />
-                  <Line type="monotone" dataKey="engagement" stroke="var(--accent)" strokeWidth={2} dot={false} />
-                  <ReferenceLine x={playhead} stroke="#f97316" strokeDasharray="4 4" />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-            <p style={{ fontSize: '0.78rem', marginTop: '0.35rem', opacity: 0.85 }}>
-              Orange dashed line tracks playback time. Click heatmap cells to jump the playhead.
-            </p>
-          </section>
-
-          {result.feedback ? (
-            <section className="panel">
-              <h2>Feedback on predicted brain response</h2>
-              <div className="feedback-grid">
-                <div className="feedback-block fb-positive">
-                  <h3>Positives</h3>
-                  <ul className="feedback-list">
-                    {result.feedback.positives.map((x) => (
-                      <li key={x}>{x}</li>
-                    ))}
-                  </ul>
-                </div>
-                <div className="feedback-block fb-negative">
-                  <h3>Negatives / risks</h3>
-                  <ul className="feedback-list">
-                    {result.feedback.negatives.map((x) => (
-                      <li key={x}>{x}</li>
-                    ))}
-                  </ul>
-                </div>
-                <div className="feedback-block fb-tips" style={{ gridColumn: '1 / -1' }}>
-                  <h3>Ways to increase predicted stimulation</h3>
-                  <ul className="feedback-list">
-                    {result.feedback.stimulation_tips.map((x) => (
-                      <li key={x}>{x}</li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
-              <p className="disclaimer">{result.feedback.disclaimer}</p>
-            </section>
-          ) : null}
-        </>
+      {loading ? <ProcessingState progress={uploadProgress} /> : null}
+      {error ? <div className="nw-error">{error}</div> : null}
+      {result?.fallback_error ? (
+        <div className="nw-warning">
+          <strong>Using fallback output.</strong>
+          <span>{result.fallback_error}</span>
+        </div>
       ) : null}
 
-      <p className="ref-link">
-        Model card &amp; install:{' '}
-        <a href="https://huggingface.co/facebook/tribev2" target="_blank" rel="noreferrer">
-          huggingface.co/facebook/tribev2
-        </a>
-      </p>
+      <section id="dashboard" className="nw-dashboard">
+        <div className="nw-video-card">
+          <div className="nw-card-heading">
+            <div>
+              <p className="nw-kicker">source clip</p>
+              <h2>Playback lab</h2>
+            </div>
+            {result ? <span className="nw-mode-pill">{modeLabel}</span> : null}
+          </div>
+          <div className="nw-video-frame">
+            {videoSrc ? (
+              <video ref={videoRef} src={videoSrc} controls onTimeUpdate={(event) => setPlayhead(event.currentTarget.currentTime)} />
+            ) : (
+              <div className="nw-empty-video">
+                <FileVideo size={42} />
+                <span>Upload a creator clip to start the report.</span>
+              </div>
+            )}
+          </div>
+          <div className="nw-time-row">
+            <span>Current time</span>
+            <strong>{formatTime(playhead)}</strong>
+          </div>
+        </div>
+
+        <aside className="nw-report-card">
+          <div className="nw-card-heading">
+            <div>
+              <p className="nw-kicker">creator report</p>
+              <h2>{report ? 'Ready to edit' : 'Waiting for upload'}</h2>
+            </div>
+            <Sparkles size={22} />
+          </div>
+
+          {report ? (
+            <>
+              <div className="nw-runtime-status">
+                <span>Inference source</span>
+                <strong>{modeLabel}</strong>
+              </div>
+              <div className="nw-score-grid">
+                <ScoreCard icon={<Activity size={18} />} label="overall" value={report.overall_score} />
+                <ScoreCard icon={<Flame size={18} />} label="hook" value={report.hook_score} />
+                <ScoreCard icon={<AlertTriangle size={18} />} label="risk" value={report.retention_risk} suffix="%" />
+                <ScoreCard icon={<Zap size={18} />} label="peaks / 10s" value={report.peak_density} compact />
+              </div>
+
+              <section className="nw-insight-block">
+                <h3>Top moments</h3>
+                <SegmentList segments={report.peak_segments} emptyText="No peak moments yet." onSeek={seekTo} />
+              </section>
+
+              <section className="nw-insight-block">
+                <h3>Stale sections</h3>
+                <SegmentList segments={report.stale_segments} emptyText="No stale stretches detected." onSeek={seekTo} />
+              </section>
+            </>
+          ) : (
+            <div className="nw-empty-report">
+              <Clock size={28} />
+              <p>
+                The dashboard will show hook score, retention risk, top moments, stale sections,
+                and suggested cuts after analysis.
+              </p>
+            </div>
+          )}
+        </aside>
+      </section>
+
+      {report ? (
+        <>
+          <section className="nw-timeline-card">
+            <div className="nw-card-heading">
+              <div>
+                <p className="nw-kicker">brain engagement timeline</p>
+                <h2>Clickable predicted response over time</h2>
+              </div>
+              <span className="nw-legend"><span /> stale zones shaded</span>
+            </div>
+            <div className="nw-chart">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart
+                  data={chartData}
+                  margin={{ top: 12, right: 20, left: 0, bottom: 8 }}
+                  onClick={(state) => {
+                    if (state?.activeLabel !== undefined) seekTo(Number(state.activeLabel))
+                  }}
+                >
+                  <defs>
+                    <linearGradient id="scoreFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="var(--nw-accent)" stopOpacity={0.42} />
+                      <stop offset="95%" stopColor="var(--nw-accent)" stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="rgba(222, 231, 224, 0.08)" vertical={false} />
+                  <XAxis dataKey="t" tickFormatter={formatTime} stroke="var(--nw-muted)" fontSize={12} />
+                  <YAxis domain={[0, 100]} width={34} stroke="var(--nw-muted)" fontSize={12} />
+                  <Tooltip content={<TimelineTooltip />} />
+                  {report.stale_segments.map((segment) => (
+                    <ReferenceArea
+                      key={`${segment.start}-${segment.end}`}
+                      x1={segment.start}
+                      x2={segment.end}
+                      fill="var(--nw-danger)"
+                      fillOpacity={0.18}
+                    />
+                  ))}
+                  <ReferenceLine x={playhead} stroke="var(--nw-warm)" strokeDasharray="4 4" />
+                  <Area
+                    type="monotone"
+                    dataKey="score"
+                    stroke="var(--nw-accent)"
+                    strokeWidth={3}
+                    fill="url(#scoreFill)"
+                    activeDot={{ r: 6 }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </section>
+
+          <section className="nw-edit-grid">
+            <article className="nw-edit-card">
+              <div className="nw-card-heading">
+                <div>
+                  <p className="nw-kicker">suggested 15-second cut</p>
+                  <h2>Timestamp recipe</h2>
+                </div>
+                <Scissors size={22} />
+              </div>
+              <SegmentList segments={report.suggested_cut} emptyText="No cut suggestion yet." onSeek={seekTo} />
+            </article>
+
+            <article className="nw-edit-card">
+              <p className="nw-kicker">creator advice</p>
+              <h2>Specific fixes</h2>
+              <ul className="nw-advice-list">
+                {report.suggestions.map((suggestion) => (
+                  <li key={suggestion}>{suggestion}</li>
+                ))}
+              </ul>
+            </article>
+          </section>
+
+          <p className="nw-disclaimer">{report.disclaimer}</p>
+        </>
+      ) : null}
+    </main>
+  )
+}
+
+function ScoreCard({
+  icon,
+  label,
+  value,
+  suffix = '/100',
+  compact = false,
+}: {
+  icon: ReactNode
+  label: string
+  value: number
+  suffix?: string
+  compact?: boolean
+}) {
+  return (
+    <div className={`nw-score-card ${scoreTone(value)}`}>
+      <div className="nw-score-icon">{icon}</div>
+      <span>{label}</span>
+      <strong>
+        {compact ? value : Math.round(value)}
+        <small>{suffix}</small>
+      </strong>
+    </div>
+  )
+}
+
+function SegmentList({
+  segments,
+  emptyText,
+  onSeek,
+}: {
+  segments: CreatorSegment[]
+  emptyText: string
+  onSeek: (seconds: number) => void
+}) {
+  if (!segments.length) {
+    return <p className="nw-muted">{emptyText}</p>
+  }
+  return (
+    <ol className="nw-segment-list">
+      {segments.map((segment, index) => (
+        <li key={`${segment.start}-${segment.end}-${index}`}>
+          <button type="button" onClick={() => onSeek(segment.start)}>
+            <span>{formatTime(segment.start)}-{formatTime(segment.end)}</span>
+            {typeof segment.score === 'number' ? <strong>{Math.round(segment.score)}</strong> : null}
+          </button>
+          {segment.reason ? <p>{segment.reason}</p> : null}
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+function BrainHeatmap({ cells, score, mode }: { cells: { key: number; score: number }[]; score: number; mode: string }) {
+  return (
+    <aside className="nw-brain-card" aria-label="Animated brain response preview">
+      <div className="nw-brain-topline">
+        <span>neural response map</span>
+        <strong>{mode}</strong>
+      </div>
+      <div className="nw-brain-orb">
+        {cells.map((cell) => (
+          <span key={cell.key} style={{ '--heat': `${Math.max(8, cell.score)}%` } as CSSProperties} />
+        ))}
+      </div>
+      <div className="nw-brain-score">
+        <span>predicted engagement</span>
+        <strong>{Math.round(score)}/100</strong>
+      </div>
+    </aside>
+  )
+}
+
+function ProcessingState({ progress }: { progress: number }) {
+  return (
+    <section className="nw-processing" aria-live="polite">
+      <div>
+        <p className="nw-kicker">processing</p>
+        <h2>Extracting frames, audio, and predicted response</h2>
+      </div>
+      <div className="nw-progress-track">
+        <span style={{ width: `${Math.max(progress, 8)}%` }} />
+      </div>
+    </section>
+  )
+}
+
+function TimelineTooltip({ active, payload, label }: { active?: boolean; payload?: { value: number }[]; label?: number }) {
+  if (!active || !payload?.length) return null
+  return (
+    <div className="nw-tooltip">
+      <span>{formatTime(Number(label))}</span>
+      <strong>{Math.round(Number(payload[0].value))}/100</strong>
     </div>
   )
 }
