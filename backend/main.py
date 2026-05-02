@@ -63,6 +63,25 @@ def health():
     }
 
 
+def _remote_inference_error_detail(status: int, body: str) -> str:
+    """Short, actionable message when the tunnel returns HTML (e.g. ngrok gateway errors)."""
+    if "ERR_NGROK_3004" in body or "invalid or incomplete HTTP" in body:
+        return (
+            f"Remote HTTP {status} (ngrok ERR_NGROK_3004): ngrok did not get a valid HTTP response from the "
+            "process on Colab port 8000. Common causes: Colab session ended or uvicorn crashed (check "
+            "/content/uvicorn.log); stale REMOTE_TRIBE_URL after restarting ngrok (re-copy export from Colab); "
+            "OOM during /api/analyze; or the tunnel points at the wrong port. From your Mac, curl "
+            "https://<tunnel-host>/api/health — it should return JSON with \"status\":\"ok\"."
+        )
+    low = body[:500].lower()
+    if "<html" in low or "<!doctype" in low:
+        return (
+            f"Remote HTTP {status} returned HTML (not JSON). Tunnel or upstream error. "
+            f"Snippet: {body[:280]!r}…"
+        )
+    return body if len(body) <= 12000 else (body[:12000] + "…")
+
+
 def _remote_request_headers() -> dict[str, str]:
     """Free ngrok often interstitials browser clients; this header helps programmatic POSTs."""
     h: dict[str, str] = {}
@@ -83,21 +102,31 @@ async def _analyze_via_remote(dest: Path, include_feedback: bool) -> dict:
     timeout = httpx.Timeout(
         connect=120.0,
         read=REMOTE_TRIBE_TIMEOUT,
-        write=600.0,
+        write=max(600.0, REMOTE_TRIBE_TIMEOUT),
         pool=120.0,
     )
     headers = _remote_request_headers()
+    # Read whole file into memory so the multipart body is stable (avoids rare async+file-handle issues with tunnels).
+    file_body = dest.read_bytes()
+    suffix = dest.suffix.lower() or ".mp4"
+    media = {
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        ".avi": "video/x-msvideo",
+    }.get(suffix, "application/octet-stream")
+
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        with dest.open("rb") as fh:
-            files = {"file": (dest.name, fh, "application/octet-stream")}
-            r = await client.post(
-                REMOTE_TRIBE_URL,
-                files=files,
-                params={"include_feedback": include_feedback},
-                headers=headers or None,
-            )
+        files = {"file": (dest.name, file_body, media)}
+        r = await client.post(
+            REMOTE_TRIBE_URL,
+            files=files,
+            params={"include_feedback": include_feedback},
+            headers=headers or None,
+        )
     if r.status_code >= 400:
-        raise RuntimeError(r.text or f"Remote HTTP {r.status_code}")
+        raise RuntimeError(_remote_inference_error_detail(r.status_code, r.text))
     return r.json()
 
 
