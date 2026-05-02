@@ -62,19 +62,20 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v))
 }
 
-// Diverging cold-hot colormap (blue ↔ near-black ↔ yellow), inspired by
-// nilearn's cold_hot. Baseline (z≈0) renders as a dark grey so the cortex
-// surface and sulci stay legible while active regions visually pop.
+// Product-facing activation-intensity colormap. The underlying proxy produces
+// signed z-scores, but a signed cold/hot map can look mostly blue depending on
+// which side of the cortex is visible. For the demo, show magnitude as
+// engagement intensity: low = dark cortex green, medium = amber, high = red.
 const COLOR_STOPS: ReadonlyArray<[number, [number, number, number]]> = [
-  [-3.0, [0.10, 0.45, 0.95]], // strong blue
-  [-1.5, [0.35, 0.65, 0.95]], // light blue
-  [0.0, [0.10, 0.10, 0.12]],  // near-black baseline
-  [1.5, [0.95, 0.55, 0.20]],  // orange
-  [3.0, [0.98, 0.95, 0.30]],  // yellow
+  [0.0, [0.18, 0.32, 0.24]],  // quiet cortex green
+  [0.45, [0.38, 0.55, 0.30]], // active green
+  [0.9, [0.78, 0.62, 0.22]],  // amber
+  [1.35, [0.96, 0.34, 0.16]], // orange-red
+  [2.1, [1.00, 0.08, 0.06]],  // red peak
 ]
 
 function colorForZ(z: number, out: THREE.Color) {
-  const c = clamp(z, -3, 3)
+  const c = clamp(Math.abs(z) * 1.35, 0, 2.1)
   // Find the segment [stops[i], stops[i+1]] that contains c, lerp linearly.
   for (let i = 0; i < COLOR_STOPS.length - 1; i++) {
     const [z0, c0] = COLOR_STOPS[i]
