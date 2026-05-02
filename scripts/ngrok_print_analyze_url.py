@@ -18,12 +18,16 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 
-def pick_https_base(tunnels: list[dict]) -> str | None:
+def pick_public_base(tunnels: list[dict]) -> str | None:
+    """Prefer https:// tunnel; fall back to http:// (some agent versions differ)."""
+    https_u = http_u = None
     for t in tunnels:
         u = (t.get("public_url") or "").strip()
         if u.startswith("https://"):
-            return u.rstrip("/")
-    return None
+            https_u = u.rstrip("/")
+        elif u.startswith("http://"):
+            http_u = u.rstrip("/")
+    return https_u or http_u
 
 
 def main() -> int:
@@ -50,10 +54,12 @@ def main() -> int:
         return 1
 
     tunnels = data.get("tunnels") or []
-    base = pick_https_base(tunnels)
+    base = pick_public_base(tunnels)
     if not base:
-        print("No https:// tunnel found. Raw tunnels:", tunnels, file=sys.stderr)
+        print("No public tunnel URL found. Raw tunnels:", tunnels, file=sys.stderr)
         return 1
+    if base.startswith("http://"):
+        print("# Note: only http:// listed; https may appear after agent fully online.", file=sys.stderr)
 
     analyze = f"{base}/api/analyze"
     print(f'export REMOTE_TRIBE_URL="{analyze}"')

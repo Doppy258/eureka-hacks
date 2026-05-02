@@ -58,7 +58,7 @@ The official **Colab** extension runs notebook code on **Colab GPUs**, but it st
 - Notebook: [`notebooks/colab_tribe_backend.ipynb`](notebooks/colab_tribe_backend.ipynb)
 
 1. Install the **Colab** extension, open that notebook from this repo, choose a **Colab GPU** kernel, run all cells **in order** (through cell 5).
-2. Enter **HF** and **ngrok** authtoken when prompted (use [Your Authtoken](https://dashboard.ngrok.com/get-started/your-authtoken); **rotate** any token that was ever pasted into chat or committed to git).
+2. Add a Colab **Secret** named **`HF_TOKEN`** (HF read token) so the HF cell is instant; or paste when prompted. Optional: set `TRIBE_HF_LOGIN=1` only if you need slow `huggingface_hub.login()` Hub validation. Enter **ngrok** authtoken when prompted ([Your Authtoken](https://dashboard.ngrok.com/get-started/your-authtoken); **rotate** any token ever pasted into chat or committed to git).
 3. Edit `REPO_URL` in the notebook to your GitHub fork (or use the zip path described in the notebook).
 
 The Mac backend adds `ngrok-skip-browser-warning` automatically when the remote URL looks like ngrok, so forwarded uploads are less likely to hit the free-tier interstitial.
