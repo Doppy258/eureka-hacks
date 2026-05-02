@@ -59,8 +59,8 @@
 }
 
 .studio-root h1 {
-  max-width: 10ch;
-  font-size: clamp(3.75rem, 10vw, 8.5rem);
+  max-width: 12ch;
+  font-size: clamp(3rem, 7vw, 5.8rem);
   /* line-height was 0.84, which clipped descenders ("g", "p", "y") into the
      paragraph below at this font size. 0.95 keeps the tight editorial feel
      while leaving room for descenders inside the line box. */
