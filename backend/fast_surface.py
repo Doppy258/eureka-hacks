@@ -84,6 +84,10 @@ def _build_region_basis() -> tuple[np.ndarray, tuple[str, ...]]:
         peak = float(accum.max())
         if peak > 0:
             accum /= peak
+        # Zero out the long Gaussian tail so the (T,F)@(F,V) matmul never has to
+        # multiply against denormal floats (~1e-19). This both speeds up the
+        # matmul and stops Apple Accelerate from emitting spurious FP warnings.
+        accum[accum < 1e-6] = 0.0
         rows.append(accum)
         labels.append(name)
     return np.stack(rows, axis=0), tuple(labels)
@@ -220,7 +224,12 @@ def run_fast_surface(
     if V != FSAVERAGE5_VERTICES:
         raise RuntimeError(f"basis vertex count {V} != fsaverage5 {FSAVERAGE5_VERTICES}")
 
-    preds = feats @ basis  # (T, V), spatially smooth + anatomically located
+    # Apple Accelerate / OpenBLAS occasionally raises spurious "divide by zero"
+    # warnings when matmul touches denormal floats (the Gaussian basis tail goes
+    # down to ~1e-19). Output is always finite, so silence those warnings to keep
+    # logs clean on every demo request.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        preds = feats @ basis  # (T, V), spatially smooth + anatomically located
 
     # Per-timestep z-score + clip for the renderer.
     mu = preds.mean(axis=1, keepdims=True)
@@ -255,6 +264,68 @@ def run_fast_surface(
         "vertex_count": int(V),
         "activations": encode_f32_zlib_base64(preds),
         "region_activations": region_activations,
+    }
+
+
+def run_fast_analyze(
+    video_path: str,
+    *,
+    target_fps: float = 1.0,
+) -> dict[str, Any]:
+    """Fast video-driven AnalyzeResponse payload (no TRIBE, no GPU).
+
+    Returns the same shape as ``backend.tribe_runner.run_tribe`` /
+    ``backend.tribe_runner.run_demo`` so the FastAPI ``/api/analyze`` route can
+    swap it in transparently when ``TRIBE_REAL`` is unset.
+
+    Engagement is the per-timestep average magnitude of the 7 anatomical
+    region z-scores produced by ``run_fast_surface`` — i.e. the same real,
+    video-driven signal the brain visualizer is showing, just collapsed to a
+    single scalar per timestep.
+    """
+    surf = run_fast_surface(video_path, target_fps=target_fps)
+    region_rows = surf.get("region_activations") or []
+    starts = list(surf["timestamps_start"])
+    ends = list(surf["timestamps_end"])
+    T = len(starts)
+    if T == 0 or not region_rows:
+        # Fallback: a flat midline so the UI still has something to draw.
+        return {
+            "mode": "fast",
+            "video_duration_sec": float(surf["video_duration_sec"]),
+            "tr_sec": float(surf["tr_sec"]),
+            "timestamps_start": starts,
+            "timestamps_end": ends,
+            "engagement": [0.5 for _ in starts],
+            "region_labels": [],
+            "region_timeseries": [],
+        }
+
+    region_labels = [str(entry["name"]) for entry in region_rows[0]]
+    R = len(region_labels)
+    region_ts = np.zeros((T, R), dtype=np.float32)
+    for t, row in enumerate(region_rows):
+        for r, entry in enumerate(row):
+            region_ts[t, r] = float(entry["z"])
+
+    # Engagement = per-timestep mean of |z| across the anatomical regions, then
+    # min-max normalized to roughly [0, 1] so downstream code that treats it as
+    # a "score" gets a sensible range.
+    eng = np.abs(region_ts).mean(axis=1)
+    if eng.max() > eng.min():
+        eng_norm = (eng - eng.min()) / (eng.max() - eng.min())
+    else:
+        eng_norm = np.full_like(eng, 0.5)
+
+    return {
+        "mode": "fast",
+        "video_duration_sec": float(surf["video_duration_sec"]),
+        "tr_sec": float(surf["tr_sec"]),
+        "timestamps_start": starts,
+        "timestamps_end": ends,
+        "engagement": eng_norm.astype(float).tolist(),
+        "region_labels": region_labels,
+        "region_timeseries": region_ts.astype(float).tolist(),
     }
 
 

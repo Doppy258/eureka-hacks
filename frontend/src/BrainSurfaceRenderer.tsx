@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 
@@ -62,13 +62,34 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v))
 }
 
+// Diverging cold-hot colormap (blue ↔ near-black ↔ yellow), inspired by
+// nilearn's cold_hot. Baseline (z≈0) renders as a dark grey so the cortex
+// surface and sulci stay legible while active regions visually pop.
+const COLOR_STOPS: ReadonlyArray<[number, [number, number, number]]> = [
+  [-3.0, [0.10, 0.45, 0.95]], // strong blue
+  [-1.5, [0.35, 0.65, 0.95]], // light blue
+  [0.0, [0.10, 0.10, 0.12]],  // near-black baseline
+  [1.5, [0.95, 0.55, 0.20]],  // orange
+  [3.0, [0.98, 0.95, 0.30]],  // yellow
+]
+
 function colorForZ(z: number, out: THREE.Color) {
-  // z in [-3, 3] -> teal/green heat (match existing viewer)
-  const t = (clamp(z, -3, 3) + 3) / 6
-  const hue = 160 - t * 55 // 160->105
-  const sat = 0.75
-  const light = (30 + t * 30) / 100
-  out.setHSL(hue / 360, sat, light)
+  const c = clamp(z, -3, 3)
+  // Find the segment [stops[i], stops[i+1]] that contains c, lerp linearly.
+  for (let i = 0; i < COLOR_STOPS.length - 1; i++) {
+    const [z0, c0] = COLOR_STOPS[i]
+    const [z1, c1] = COLOR_STOPS[i + 1]
+    if (c <= z1) {
+      const t = z1 === z0 ? 0 : (c - z0) / (z1 - z0)
+      const r = c0[0] + (c1[0] - c0[0]) * t
+      const g = c0[1] + (c1[1] - c0[1]) * t
+      const b = c0[2] + (c1[2] - c0[2]) * t
+      out.setRGB(r, g, b)
+      return
+    }
+  }
+  const last = COLOR_STOPS[COLOR_STOPS.length - 1][1]
+  out.setRGB(last[0], last[1], last[2])
 }
 
 export default function BrainSurfaceRenderer({
@@ -100,6 +121,13 @@ export default function BrainSurfaceRenderer({
     return clamp(timestep, 0, T - 1)
   }, [activations.length, hemiN, timestep])
 
+  // Bumped every time the mesh useEffect creates a fresh state. Including this
+  // in the activations effect's deps forces the color update to re-run after a
+  // StrictMode (or HMR) re-mount, which otherwise leaves the new mesh stuck on
+  // its initial neutral-green colors with no activation heatmap painted.
+  const meshVersionRef = useRef(0)
+  const [meshVersion, setMeshVersion] = useState(0)
+
   useEffect(() => {
     const mount = mountRef.current
     if (!mount) return
@@ -114,7 +142,11 @@ export default function BrainSurfaceRenderer({
     mount.appendChild(renderer.domElement)
 
     const scene = new THREE.Scene()
-    scene.fog = new THREE.FogExp2(0x07100c, 0.03)
+    // Note: previously used FogExp2(0x07100c, 0.03), which made transmittance
+    // ~exp(-d^2 * 9e-4). At the camera distance computed below (~500mm in
+    // fsaverage5 RAS units) the brain was 100% fogged out — the canvas looked
+    // empty. Linear fog scoped roughly to the brain's depth keeps a soft
+    // atmospheric falloff without erasing the mesh.
 
     const camera = new THREE.PerspectiveCamera(40, w / h, 0.1, 5000)
     camera.position.set(0, 0, 300)
@@ -179,18 +211,32 @@ export default function BrainSurfaceRenderer({
     const rh = buildHemi(mesh.rh.vertices_b64, mesh.rh.faces_b64, 8)
 
     // Auto-center camera on the combined bounding box and frame the mesh.
+    // After the RAS->Three.js rotation, size.z is *depth* (front/back of head),
+    // which is irrelevant to the on-screen extent. Fit to the visible plane only
+    // and add breathing room so the brain isn't cropped.
     const bbox = new THREE.Box3()
       .union(new THREE.Box3().setFromBufferAttribute(lh.geometry.getAttribute('position') as THREE.BufferAttribute))
       .union(new THREE.Box3().setFromBufferAttribute(rh.geometry.getAttribute('position') as THREE.BufferAttribute))
     const center = bbox.getCenter(new THREE.Vector3())
     const size = bbox.getSize(new THREE.Vector3())
-    const maxDim = Math.max(size.x, size.y, size.z)
+    const visibleDim = Math.max(size.x, size.y)
     const fovRad = (camera.fov * Math.PI) / 180
-    const fitDist = (maxDim * 0.5) / Math.tan(fovRad * 0.5)
-    const distance = fitDist * 1.6
+    const fitDist = (visibleDim * 0.5) / Math.tan(fovRad * 0.5)
+    const distance = fitDist * 2.2
     controls.target.copy(center)
-    camera.position.set(center.x, center.y, center.z + distance)
+    // Slight 3/4 lateral angle: head turns ~20° so the lateral surface (where
+    // most active regions live) is visible instead of a flat occipital view.
+    camera.position.set(
+      center.x + distance * 0.35,
+      center.y + distance * 0.05,
+      center.z + distance * 0.95,
+    )
     controls.update()
+
+    // Soft linear fog scoped to the brain's depth, so it adds atmospheric
+    // falloff without making the mesh disappear at the camera's actual
+    // distance (~`distance` in mesh units).
+    scene.fog = new THREE.Fog(0x07100c, distance * 0.6, distance * 2.4)
 
     let raf = 0
     const onResize = () => {
@@ -217,10 +263,16 @@ export default function BrainSurfaceRenderer({
       rh.geometry.dispose()
       mat.dispose()
       renderer.dispose()
-      mount.removeChild(renderer.domElement)
+      // The parent may have already detached the canvas (StrictMode tear-down,
+      // HMR, or unmount race). Guard against the resulting NotFoundError.
+      if (renderer.domElement.parentNode === mount) {
+        mount.removeChild(renderer.domElement)
+      }
     }
 
     stateRef.current = { renderer, scene, camera, controls, lh, rh, dispose }
+    meshVersionRef.current += 1
+    setMeshVersion(meshVersionRef.current)
     return () => {
       stateRef.current?.dispose()
       stateRef.current = null
@@ -256,7 +308,9 @@ export default function BrainSurfaceRenderer({
       st.rh.colors[o + 2] = tmp.b
     }
     ;(st.rh.geometry.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true
-  }, [activations, hemiN, t])
+    // meshVersion is intentionally a dep here so the heatmap re-paints onto
+    // every freshly created scene (StrictMode re-mount, HMR, mesh swap).
+  }, [activations, hemiN, t, meshVersion])
 
   return <div ref={mountRef} style={{ width: '100%', height: '100%', ...style }} />
 }

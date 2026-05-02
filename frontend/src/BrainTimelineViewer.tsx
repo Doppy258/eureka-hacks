@@ -25,6 +25,11 @@ type EncodedFloatArray = {
   data_b64: string
 }
 
+type RegionActivation = {
+  name: string
+  z: number
+}
+
 type BrainSurfaceTimelineResponse = {
   job_id?: string | null
   video_url: string
@@ -36,6 +41,7 @@ type BrainSurfaceTimelineResponse = {
   vertex_count: number
   mesh: { name: string; url: string }
   activations: EncodedFloatArray
+  region_activations?: RegionActivation[][]
 }
 
 function formatTime(seconds: number): string {
@@ -285,6 +291,16 @@ export default function BrainTimelineViewer() {
     }
   }
 
+  const topRegions = useMemo(() => {
+    if (!surface?.timeline.region_activations) return null
+    const row = surface.timeline.region_activations[activeIndex]
+    if (!row || row.length === 0) return null
+    return row
+      .slice()
+      .sort((a, b) => Math.abs(b.z) - Math.abs(a.z))
+      .slice(0, 3)
+  }, [surface, activeIndex])
+
   const active = useMemo(() => {
     if (surface) {
       const idx = clamp(activeIndex, 0, surface.timeline.timestamps_start.length - 1)
@@ -437,6 +453,45 @@ export default function BrainTimelineViewer() {
                 <canvas ref={canvasRef} style={{ width: '100%', height: '100%', display: 'block' }} />
               )}
             </div>
+            {topRegions ? (
+              <div
+                className="nw-region-caption"
+                style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '8px 14px',
+                  padding: '10px 12px',
+                  marginTop: 10,
+                  borderRadius: 14,
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  background: 'rgba(255,255,255,0.03)',
+                  fontSize: 13,
+                  fontWeight: 600,
+                  letterSpacing: 0.1,
+                }}
+              >
+                {topRegions.map((r) => {
+                  const positive = r.z > 0
+                  return (
+                    <span
+                      key={r.name}
+                      style={{
+                        color: positive ? '#fbbf77' : '#7fb6ff',
+                        display: 'inline-flex',
+                        alignItems: 'baseline',
+                        gap: 4,
+                      }}
+                    >
+                      <span aria-hidden="true">{positive ? '↑' : '↓'}</span>
+                      <span>{r.name}</span>
+                      <span style={{ opacity: 0.55, fontWeight: 500 }}>
+                        ({r.z >= 0 ? '+' : ''}{r.z.toFixed(2)})
+                      </span>
+                    </span>
+                  )
+                })}
+              </div>
+            ) : null}
             <div className="nw-brain-score">
               <span>window</span>
               <strong>{active ? `${formatTime(active.start)}-${formatTime(active.end)}` : '--'}</strong>

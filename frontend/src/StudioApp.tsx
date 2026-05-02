@@ -12,7 +12,20 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { Activity, AlertTriangle, Brain, Clock, FileVideo, Flame, Scissors, Sparkles, Upload, Zap } from 'lucide-react'
+import {
+  Activity,
+  AlertTriangle,
+  Brain,
+  Clock,
+  FileVideo,
+  Flame,
+  RotateCcw,
+  Scissors,
+  Sparkles,
+  Upload,
+  Zap,
+} from 'lucide-react'
+import BrainSurfaceRenderer, { decodeEncodedFloat32, type SurfaceMeshJson } from './BrainSurfaceRenderer'
 import './studio.css'
 import './App.css'
 
@@ -65,6 +78,38 @@ type AnalyzeResponse = {
     creator_report?: CreatorReport
   } | null
   fallback_error?: string | null
+}
+
+type EncodedFloatArray = {
+  dtype: 'float32'
+  shape: number[]
+  compression: 'zlib'
+  data_b64: string
+}
+
+type RegionActivation = {
+  name: string
+  z: number
+}
+
+type BrainSurfaceTimelineResponse = {
+  job_id?: string | null
+  video_url: string
+  mode: string
+  video_duration_sec: number
+  tr_sec: number
+  timestamps_start: number[]
+  timestamps_end: number[]
+  vertex_count: number
+  mesh: { name: string; url: string }
+  activations: EncodedFloatArray
+  region_activations?: RegionActivation[][]
+}
+
+type SurfaceState = {
+  timeline: BrainSurfaceTimelineResponse
+  mesh: SurfaceMeshJson
+  activations: Float32Array
 }
 
 type ChartPoint = {
@@ -151,6 +196,9 @@ function getModeLabel(result: AnalyzeResponse): string {
   if (result.inference_source === 'local') {
     return result.mode === 'tribe' ? 'local TRIBE v2' : 'demo-safe proxy'
   }
+  if (result.inference_source === 'fast') {
+    return 'fast video-driven proxy'
+  }
   return result.mode === 'tribe' ? 'TRIBE v2' : 'demo-safe proxy'
 }
 
@@ -172,6 +220,37 @@ function scoreTone(score: number): string {
   return 'risk'
 }
 
+// The mesh endpoint is static and immutable, so we always hit the same URL.
+// Caching the in-flight promise (and the decoded result) means the second
+// surface load — for example after a real upload — never fetches the 1MB mesh
+// JSON again.
+const MESH_URL = '/api/brain/surface/fsaverage5'
+let meshPromise: Promise<SurfaceMeshJson> | null = null
+
+function fetchMeshOnce(): Promise<SurfaceMeshJson> {
+  if (meshPromise) return meshPromise
+  meshPromise = (async () => {
+    const meshRes = await fetch(MESH_URL)
+    if (!meshRes.ok) {
+      meshPromise = null
+      throw new Error((await meshRes.text()) || meshRes.statusText)
+    }
+    return (await meshRes.json()) as SurfaceMeshJson
+  })()
+  return meshPromise
+}
+
+async function fetchSurfaceFromTimeline(
+  timeline: BrainSurfaceTimelineResponse,
+  meshOverride?: SurfaceMeshJson,
+): Promise<SurfaceState> {
+  const [mesh, activations] = await Promise.all([
+    meshOverride ? Promise.resolve(meshOverride) : fetchMeshOnce(),
+    decodeEncodedFloat32(timeline.activations),
+  ])
+  return { timeline, mesh, activations }
+}
+
 export default function StudioApp() {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const previewUrlRef = useRef<string | null>(null)
@@ -181,6 +260,10 @@ export default function StudioApp() {
   const [uploadProgress, setUploadProgress] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<AnalyzeResponse | null>(null)
+  const [surface, setSurface] = useState<SurfaceState | null>(null)
+  const [surfaceError, setSurfaceError] = useState<string | null>(null)
+  const [demoLoading, setDemoLoading] = useState(true)
+  const [usingDemo, setUsingDemo] = useState(true)
   const [playhead, setPlayhead] = useState(0)
 
   useEffect(() => {
@@ -188,6 +271,71 @@ export default function StudioApp() {
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current)
     }
   }, [])
+
+  // Auto-load the precomputed IMG_2225.mp4 demo so the studio is interactive
+  // immediately on mount. Both fetches are JSON cache hits (~hundreds of ms).
+  const loadDemo = useCallback(async (): Promise<void> => {
+    setDemoLoading(true)
+    setError(null)
+    setSurfaceError(null)
+    try {
+      // Fire all three requests in parallel (analyze, surface timeline, mesh).
+      // The mesh is static and module-cached so subsequent demo reloads skip it.
+      const meshReq = fetchMeshOnce().catch(() => null)
+      const analyzeReq = fetch('/api/hardcoded/analyze').then(async (r) => {
+        if (!r.ok) throw new Error((await r.text()) || r.statusText)
+        return (await r.json()) as AnalyzeResponse
+      })
+      const surfaceReq = fetch('/api/hardcoded/brain_surface').then(async (r) => {
+        if (!r.ok) throw new Error((await r.text()) || r.statusText)
+        return (await r.json()) as BrainSurfaceTimelineResponse
+      })
+
+      const [analyzeRes, surfaceTimeline] = await Promise.allSettled([analyzeReq, surfaceReq])
+
+      if (analyzeRes.status === 'fulfilled') {
+        setResult(analyzeRes.value)
+        setUsingDemo(true)
+      } else {
+        throw analyzeRes.reason instanceof Error
+          ? analyzeRes.reason
+          : new Error(String(analyzeRes.reason))
+      }
+
+      if (surfaceTimeline.status === 'fulfilled') {
+        try {
+          const mesh = (await meshReq) ?? undefined
+          const next = await fetchSurfaceFromTimeline(surfaceTimeline.value, mesh)
+          setSurface(next)
+        } catch (e) {
+          setSurfaceError(e instanceof Error ? e.message : 'Failed to load brain surface mesh.')
+          setSurface(null)
+        }
+      } else {
+        setSurfaceError(
+          surfaceTimeline.reason instanceof Error
+            ? surfaceTimeline.reason.message
+            : String(surfaceTimeline.reason),
+        )
+        setSurface(null)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load demo clip.')
+    } finally {
+      setDemoLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      if (cancelled) return
+      await loadDemo()
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [loadDemo])
 
   const report = useMemo(() => {
     if (!result) return null
@@ -216,7 +364,41 @@ export default function StudioApp() {
     })
   }, [report])
 
-  const videoSrc = result?.video_url ?? previewUrl ?? undefined
+  // Map the current playhead -> active surface timestep via binary search over
+  // timestamps_start. Mirrors the BrainTimelineViewer behavior so the brain
+  // updates as the source clip plays.
+  const surfaceTimestep = useMemo(() => {
+    if (!surface) return 0
+    const starts = surface.timeline.timestamps_start
+    if (!starts.length) return 0
+    let lo = 0
+    let hi = starts.length - 1
+    let best = 0
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (starts[mid] <= playhead) {
+        best = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    return best
+  }, [surface, playhead])
+
+  const topRegions = useMemo(() => {
+    if (!surface?.timeline.region_activations) return null
+    const row = surface.timeline.region_activations[surfaceTimestep]
+    if (!row || row.length === 0) return null
+    return row
+      .slice()
+      .sort((a, b) => Math.abs(b.z) - Math.abs(a.z))
+      .slice(0, 3)
+  }, [surface, surfaceTimestep])
+
+  // Prefer the user's local preview URL while a custom video is selected so
+  // playback works instantly even before the analysis completes.
+  const videoSrc = previewUrl ?? result?.video_url ?? undefined
 
   const onFile = (event: React.ChangeEvent<HTMLInputElement>) => {
     const selected = event.target.files?.[0] ?? null
@@ -224,7 +406,6 @@ export default function StudioApp() {
       URL.revokeObjectURL(previewUrlRef.current)
       previewUrlRef.current = null
     }
-    setResult(null)
     setError(null)
     setUploadProgress(0)
     if (!selected) {
@@ -243,7 +424,21 @@ export default function StudioApp() {
     previewUrlRef.current = url
     setFile(selected)
     setPreviewUrl(url)
+    // Picking a custom file means we're no longer "in demo mode"; the demo
+    // analysis result stays visible until the new analysis completes.
+    setUsingDemo(false)
   }
+
+  const resetToDemo = useCallback(async () => {
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current)
+      previewUrlRef.current = null
+    }
+    setFile(null)
+    setPreviewUrl(null)
+    setUploadProgress(0)
+    await loadDemo()
+  }, [loadDemo])
 
   const seekTo = useCallback((seconds: number) => {
     const video = videoRef.current
@@ -261,15 +456,15 @@ export default function StudioApp() {
     setLoading(true)
     setUploadProgress(0)
     setError(null)
+    setSurfaceError(null)
     setResult(null)
+    setSurface(null)
+    setUsingDemo(false)
 
-    const formData = new FormData()
-    formData.append('file', file)
-
-    try {
-      const data = await new Promise<AnalyzeResponse>((resolve, reject) => {
+    const postWithProgress = <T,>(url: string): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
-        xhr.open('POST', '/api/analyze?include_feedback=true')
+        xhr.open('POST', url)
         xhr.upload.onprogress = (event) => {
           if (event.lengthComputable) {
             setUploadProgress(Math.round((event.loaded / event.total) * 100))
@@ -277,16 +472,51 @@ export default function StudioApp() {
         }
         xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) {
-            resolve(JSON.parse(xhr.responseText) as AnalyzeResponse)
+            resolve(JSON.parse(xhr.responseText) as T)
             return
           }
           reject(new Error(apiErrorMessage(xhr.responseText, xhr.statusText)))
         }
         xhr.onerror = () => reject(new Error('Connection failed. Is the FastAPI backend running on port 8000?'))
+        const formData = new FormData()
+        formData.append('file', file)
         xhr.send(formData)
       })
+
+    try {
+      // Run the heavy report and the brain-surface fetch in parallel; the
+      // surface route uses the fast video-driven proxy (~seconds) so it almost
+      // always finishes before the report.
+      const [analyzeRes, surfaceRes] = await Promise.allSettled([
+        postWithProgress<AnalyzeResponse>('/api/analyze?include_feedback=true'),
+        postWithProgress<BrainSurfaceTimelineResponse>('/api/brain/surface_timeline'),
+      ])
+
+      if (analyzeRes.status === 'fulfilled') {
+        setResult(analyzeRes.value)
+      } else {
+        throw analyzeRes.reason instanceof Error
+          ? analyzeRes.reason
+          : new Error(String(analyzeRes.reason))
+      }
+
+      if (surfaceRes.status === 'fulfilled') {
+        try {
+          const next = await fetchSurfaceFromTimeline(surfaceRes.value)
+          setSurface(next)
+        } catch (e) {
+          setSurfaceError(e instanceof Error ? e.message : 'Failed to load brain surface mesh.')
+          setSurface(null)
+        }
+      } else {
+        setSurfaceError(
+          surfaceRes.reason instanceof Error
+            ? surfaceRes.reason.message
+            : String(surfaceRes.reason),
+        )
+      }
+
       setUploadProgress(100)
-      setResult(data)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Analysis failed.')
     } finally {
@@ -314,8 +544,9 @@ export default function StudioApp() {
             <p className="nw-kicker">pre-upload brain-response debugger</p>
             <h1>See where your content wakes the brain up, and where it goes stale.</h1>
             <p className="nw-lede">
-              Upload a short video and get a creator report: hook score, stale sections, top moments,
-              a suggested 15-second cut, and timestamped edit notes.
+              {usingDemo
+                ? 'Demo clip pre-loaded. Press play and watch the brain respond — then upload your own video to compare.'
+                : 'Upload a short video and get a creator report: hook score, stale sections, top moments, a suggested 15-second cut, and timestamped edit notes.'}
             </p>
             <div className="nw-hero-actions">
               <label className="nw-upload-button">
@@ -323,14 +554,44 @@ export default function StudioApp() {
                 <span>{file ? file.name : 'Choose video'}</span>
                 <input type="file" accept=".mp4,.mov,.webm,video/mp4,video/quicktime,video/webm" onChange={onFile} />
               </label>
-              <button type="button" className="nw-primary-button" disabled={loading} onClick={analyze}>
+              <button
+                type="button"
+                className="nw-primary-button"
+                disabled={loading || !file}
+                onClick={analyze}
+              >
                 {loading ? 'Analyzing…' : 'Analyze video'}
               </button>
+              {!usingDemo ? (
+                <button
+                  type="button"
+                  className="nw-secondary-button"
+                  disabled={loading || demoLoading}
+                  onClick={() => {
+                    void resetToDemo()
+                  }}
+                >
+                  <RotateCcw size={16} />
+                  <span>Reset to demo</span>
+                </button>
+              ) : null}
             </div>
-            <p className="nw-file-note">MVP supports .mp4, .mov, and .webm clips from 10 to 90 seconds.</p>
+            <p className="nw-file-note">
+              {usingDemo
+                ? 'Showing the bundled IMG_2225 demo (precomputed). MVP supports .mp4, .mov, and .webm clips from 10 to 90 seconds.'
+                : 'MVP supports .mp4, .mov, and .webm clips from 10 to 90 seconds.'}
+            </p>
           </div>
 
-          <BrainHeatmap cells={brainCells} score={report?.overall_score ?? 42} mode={modeLabel} />
+          <DemoBrain
+            surface={surface}
+            timestep={surfaceTimestep}
+            topRegions={topRegions}
+            fallbackCells={brainCells}
+            score={report?.overall_score ?? 42}
+            mode={demoLoading && usingDemo ? 'loading demo…' : modeLabel}
+            surfaceError={surfaceError}
+          />
         </div>
       </section>
 
@@ -562,6 +823,73 @@ function BrainHeatmap({ cells, score, mode }: { cells: { key: number; score: num
         <span>predicted engagement</span>
         <strong>{Math.round(score)}/100</strong>
       </div>
+    </aside>
+  )
+}
+
+function DemoBrain({
+  surface,
+  timestep,
+  topRegions,
+  fallbackCells,
+  score,
+  mode,
+  surfaceError,
+}: {
+  surface: SurfaceState | null
+  timestep: number
+  topRegions: RegionActivation[] | null
+  fallbackCells: { key: number; score: number }[]
+  score: number
+  mode: string
+  surfaceError: string | null
+}) {
+  if (!surface) {
+    // Surface fetch is still in flight or errored: show the legacy 24-cell
+    // heatmap so the page never goes blank. The demo orchestrator surfaces
+    // the underlying error in a banner above the fold.
+    return <BrainHeatmap cells={fallbackCells} score={score} mode={mode} />
+  }
+  return (
+    <aside className="nw-brain-card" aria-label="Predicted brain surface response">
+      <div className="nw-brain-topline">
+        <span>cortical surface (fsaverage5)</span>
+        <strong>{mode}</strong>
+      </div>
+      <div className="nw-brain-3d">
+        <BrainSurfaceRenderer
+          mesh={surface.mesh}
+          activations={surface.activations}
+          timestep={timestep}
+          style={{ background: 'rgba(7, 16, 12, 1)' }}
+        />
+      </div>
+      {topRegions && topRegions.length > 0 ? (
+        <div className="nw-region-caption">
+          {topRegions.map((r) => {
+            const positive = r.z > 0
+            return (
+              <span key={r.name} className={positive ? 'nw-region-up' : 'nw-region-down'}>
+                <span aria-hidden="true">{positive ? '↑' : '↓'}</span>
+                <span>{r.name}</span>
+                <span className="nw-region-z">
+                  ({r.z >= 0 ? '+' : ''}
+                  {r.z.toFixed(2)})
+                </span>
+              </span>
+            )
+          })}
+        </div>
+      ) : null}
+      <div className="nw-brain-score">
+        <span>predicted engagement</span>
+        <strong>{Math.round(score)}/100</strong>
+      </div>
+      {surfaceError ? (
+        <div className="nw-region-error" role="status">
+          {surfaceError}
+        </div>
+      ) : null}
     </aside>
   )
 }
