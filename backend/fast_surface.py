@@ -2,8 +2,9 @@
 
 This module deliberately avoids the heavy TRIBE v2 feature extractors (which need
 a GPU to be practical). Instead it derives per-timestep features directly from
-the uploaded video — luminance, contrast, motion, center-vs-surround, audio
-loudness — and projects them onto the 20,484 fsaverage5 cortical vertices.
+the uploaded video — luminance, contrast, flicker, spatial entropy, edge density,
+motion, center-vs-surround, composition imbalance, audio loudness, and audio
+transients — and projects them onto the 20,484 fsaverage5 cortical vertices.
 
 The result is a fast (~seconds), deterministic, video-driven brain timeline
 suitable for interactive scrubbing in the web UI without GPU inference.
@@ -16,6 +17,7 @@ import json
 import logging
 import shutil
 import subprocess
+import zlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -163,12 +165,31 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     return ((x - mu) / sd).astype(np.float32)
 
 
+def _frame_entropy(frames: np.ndarray, bins: int = 16) -> np.ndarray:
+    """Approximate per-frame grayscale entropy.
+
+    This captures visual complexity / texture density. It is intentionally small
+    (16 bins) so it adds a useful signal without becoming a heavy model.
+    """
+    out = np.zeros(frames.shape[0], dtype=np.float32)
+    for i, frame in enumerate(frames):
+        hist, _ = np.histogram(frame, bins=bins, range=(0.0, 1.0), density=False)
+        p = hist.astype(np.float32)
+        total = float(p.sum())
+        if total <= 0:
+            continue
+        p /= total
+        p = p[p > 0]
+        out[i] = float(-(p * np.log2(p)).sum() / np.log2(bins))
+    return out
+
+
 def run_fast_surface(
     video_path: str,
     *,
-    target_fps: float = 1.0,
-    width: int = 96,
-    height: int = 54,
+    target_fps: float = 2.0,
+    width: int = 160,
+    height: int = 90,
 ) -> dict[str, Any]:
     """Fast video-driven brain surface timeline.
 
@@ -188,32 +209,45 @@ def run_fast_surface(
     contrast = f.std(axis=(1, 2))
     cy, cx = height // 2, width // 2
     rh, rw = height // 5, width // 5
-    center = f[:, cy - rh : cy + rh, cx - rw : cx + rw].mean(axis=(1, 2))
+    center_patch = f[:, cy - rh : cy + rh, cx - rw : cx + rw]
+    center = center_patch.mean(axis=(1, 2))
+    center_contrast = center_patch.std(axis=(1, 2))
     surround = brightness  # close enough proxy
     cs = center - surround
 
     # Motion: mean absolute frame diff.
-    diffs = np.abs(f[1:] - f[:-1]).mean(axis=(1, 2))
-    motion = np.concatenate([[0.0], diffs])
+    frame_diff = np.abs(f[1:] - f[:-1])
+    motion = np.concatenate([[0.0], frame_diff.mean(axis=(1, 2))])
+    center_motion = np.concatenate([[0.0], np.abs(center_patch[1:] - center_patch[:-1]).mean(axis=(1, 2))])
+    brightness_flicker = np.concatenate([[0.0], np.abs(np.diff(brightness))])
+    motion_onset = np.concatenate([[0.0], np.abs(np.diff(motion))])
 
     # Optical-flow-ish horizontal/vertical gradients (cheap proxy):
     gx = np.abs(np.diff(f, axis=2)).mean(axis=(1, 2))
     gy = np.abs(np.diff(f, axis=1)).mean(axis=(1, 2))
+    edge_density = np.sqrt(gx * gx + gy * gy)
+    entropy = _frame_entropy(f)
+
+    # Coarse composition imbalance: asymmetric shots often feel more dynamic
+    # than perfectly flat frames, and top/bottom changes catch vertical motion.
+    left_right_delta = f[:, :, : cx].mean(axis=(1, 2)) - f[:, :, cx:].mean(axis=(1, 2))
+    top_bottom_delta = f[:, : cy, :].mean(axis=(1, 2)) - f[:, cy:, :].mean(axis=(1, 2))
 
     # --- Audio loudness aligned to T ---
     audio_env = _ffmpeg_extract_audio_envelope(video_path, target_T=T)
+    audio_transient = np.concatenate([[0.0], np.abs(np.diff(audio_env))])
 
     # Feature order MUST match REGION_CENTROIDS row order: V1, V2/V3, foveal V1,
     # MT+, lateral V1/V2, dorsal V3, A1.
     feats = np.stack(
         [
-            _zscore(brightness),  # -> V1 (occipital pole)
-            _zscore(contrast),    # -> V2/V3
-            _zscore(cs),          # -> foveal V1
-            _zscore(motion),      # -> MT+ bilateral
-            _zscore(gx),          # -> lateral V1/V2 bilateral
-            _zscore(gy),          # -> dorsal V3 bilateral
-            _zscore(audio_env),   # -> A1 bilateral
+            0.65 * _zscore(brightness) + 0.35 * _zscore(brightness_flicker),                 # -> V1
+            0.55 * _zscore(contrast) + 0.30 * _zscore(edge_density) + 0.15 * _zscore(entropy), # -> V2/V3
+            0.60 * _zscore(cs) + 0.25 * _zscore(center_contrast) + 0.15 * _zscore(center_motion), # -> foveal V1
+            0.70 * _zscore(motion) + 0.30 * _zscore(motion_onset),                            # -> MT+
+            0.60 * _zscore(gx) + 0.25 * _zscore(edge_density) + 0.15 * _zscore(left_right_delta), # -> lateral V1/V2
+            0.65 * _zscore(gy) + 0.20 * _zscore(motion_onset) + 0.15 * _zscore(top_bottom_delta), # -> dorsal V3
+            0.70 * _zscore(audio_env) + 0.30 * _zscore(audio_transient),                      # -> A1
         ],
         axis=1,
     )  # (T, F=7)
@@ -267,23 +301,14 @@ def run_fast_surface(
     }
 
 
-def run_fast_analyze(
-    video_path: str,
-    *,
-    target_fps: float = 1.0,
-) -> dict[str, Any]:
-    """Fast video-driven AnalyzeResponse payload (no TRIBE, no GPU).
-
-    Returns the same shape as ``backend.tribe_runner.run_tribe`` /
-    ``backend.tribe_runner.run_demo`` so the FastAPI ``/api/analyze`` route can
-    swap it in transparently when ``TRIBE_REAL`` is unset.
+def build_fast_analyze_from_surface(surf: dict[str, Any]) -> dict[str, Any]:
+    """Derive an AnalyzeResponse-shaped payload from a fast surface payload.
 
     Engagement is the per-timestep average magnitude of the 7 anatomical
     region z-scores produced by ``run_fast_surface`` — i.e. the same real,
     video-driven signal the brain visualizer is showing, just collapsed to a
     single scalar per timestep.
     """
-    surf = run_fast_surface(video_path, target_fps=target_fps)
     region_rows = surf.get("region_activations") or []
     starts = list(surf["timestamps_start"])
     ends = list(surf["timestamps_end"])
@@ -329,6 +354,20 @@ def run_fast_analyze(
     }
 
 
+def run_fast_analyze(
+    video_path: str,
+    *,
+    target_fps: float = 1.0,
+) -> dict[str, Any]:
+    """Fast video-driven AnalyzeResponse payload (no TRIBE, no GPU).
+
+    Returns the same shape as ``backend.tribe_runner.run_tribe`` /
+    ``backend.tribe_runner.run_demo`` so the FastAPI ``/api/analyze`` route can
+    swap it in transparently when ``TRIBE_REAL`` is unset.
+    """
+    return build_fast_analyze_from_surface(run_fast_surface(video_path, target_fps=target_fps))
+
+
 def run_fast_pointcloud(
     video_path: str,
     *,
@@ -339,9 +378,6 @@ def run_fast_pointcloud(
     surf = run_fast_surface(video_path, target_fps=target_fps)
     encoded = surf["activations"]
     # Decode the float32 zlib payload back to (T, V) for downsampling.
-    import zlib
-    import base64
-
     raw = zlib.decompress(base64.b64decode(encoded["data_b64"]))
     arr = np.frombuffer(raw, dtype=np.float32).reshape(encoded["shape"])  # (T, V)
     T, V = arr.shape

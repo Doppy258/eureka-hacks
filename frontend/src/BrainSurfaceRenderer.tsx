@@ -116,9 +116,12 @@ export default function BrainSurfaceRenderer({
 
   const hemiN = mesh.vertex_count_per_hemi
 
-  const t = useMemo(() => {
+  const frame = useMemo(() => {
     const T = Math.max(1, Math.floor(activations.length / (hemiN * 2)))
-    return clamp(timestep, 0, T - 1)
+    const clamped = clamp(timestep, 0, T - 1)
+    const t0 = Math.floor(clamped)
+    const t1 = Math.min(T - 1, t0 + 1)
+    return { t0, t1, alpha: clamped - t0 }
   }, [activations.length, hemiN, timestep])
 
   // Bumped every time the mesh useEffect creates a fresh state. Including this
@@ -283,12 +286,16 @@ export default function BrainSurfaceRenderer({
     const st = stateRef.current
     if (!st) return
     const totalVerts = hemiN * 2
-    const base = t * totalVerts
+    const base0 = frame.t0 * totalVerts
+    const base1 = frame.t1 * totalVerts
     const tmp = new THREE.Color()
+    const mix = (from: number, to: number) => from + (to - from) * frame.alpha
 
     // LH
     for (let i = 0; i < hemiN; i++) {
-      const z = activations[base + i] ?? 0
+      const z0 = activations[base0 + i] ?? 0
+      const z1 = activations[base1 + i] ?? z0
+      const z = mix(z0, z1)
       colorForZ(z, tmp)
       const o = i * 3
       st.lh.colors[o] = tmp.r
@@ -298,9 +305,12 @@ export default function BrainSurfaceRenderer({
     ;(st.lh.geometry.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true
 
     // RH
-    const rhBase = base + hemiN
+    const rhBase0 = base0 + hemiN
+    const rhBase1 = base1 + hemiN
     for (let i = 0; i < hemiN; i++) {
-      const z = activations[rhBase + i] ?? 0
+      const z0 = activations[rhBase0 + i] ?? 0
+      const z1 = activations[rhBase1 + i] ?? z0
+      const z = mix(z0, z1)
       colorForZ(z, tmp)
       const o = i * 3
       st.rh.colors[o] = tmp.r
@@ -310,7 +320,7 @@ export default function BrainSurfaceRenderer({
     ;(st.rh.geometry.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true
     // meshVersion is intentionally a dep here so the heatmap re-paints onto
     // every freshly created scene (StrictMode re-mount, HMR, mesh swap).
-  }, [activations, hemiN, t, meshVersion])
+  }, [activations, frame, hemiN, meshVersion])
 
   return <div ref={mountRef} style={{ width: '100%', height: '100%', ...style }} />
 }

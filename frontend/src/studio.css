@@ -59,16 +59,10 @@
 }
 
 .studio-root h1 {
-  max-width: 12ch;
-  font-size: clamp(3rem, 7vw, 5.8rem);
-  /* line-height was 0.84, which clipped descenders ("g", "p", "y") into the
-     paragraph below at this font size. 0.95 keeps the tight editorial feel
-     while leaving room for descenders inside the line box. */
-  line-height: 0.95;
-  /* Reserve space for descender overhang so the rendered glyphs never bleed
-     into the next sibling's margin even when text-wrap balance pushes long
-     lines into the bottom row. */
-  padding-bottom: 0.12em;
+  max-width: 11.5ch;
+  font-size: clamp(2.55rem, 5.4vw, 4.9rem);
+  line-height: 1.02;
+  padding-bottom: 0.04em;
 }
 
 .studio-root h2 {
@@ -96,7 +90,7 @@
 }
 
 .nw-hero {
-  min-height: min(900px, calc(100svh - 2rem));
+  min-height: min(760px, calc(100svh - 2rem));
   padding: clamp(1rem, 2vw, 1.5rem);
   border: 1px solid var(--nw-line);
   border-radius: var(--nw-radius-xl);
@@ -155,15 +149,36 @@
 
 .nw-hero-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(20rem, 0.65fr);
-  gap: clamp(2rem, 6vw, 7rem);
-  align-items: end;
-  min-height: calc(100svh - 10rem);
-  padding: clamp(3.5rem, 7vw, 7rem) clamp(0.5rem, 3vw, 3rem) clamp(1rem, 4vw, 3rem);
+  grid-template-columns: minmax(22rem, 0.95fr) minmax(21rem, 0.75fr);
+  gap: clamp(1.5rem, 4vw, 4rem);
+  align-items: center;
+  min-height: min(640px, calc(100svh - 9rem));
+  padding: clamp(2rem, 5vw, 4.5rem) clamp(0.5rem, 3vw, 2.5rem) clamp(1rem, 3vw, 2.5rem);
+}
+
+.nw-hero-copy {
+  max-width: 46rem;
+  padding: clamp(1.15rem, 2.6vw, 2rem);
+  border: 1px solid rgba(222, 231, 224, 0.12);
+  border-radius: calc(var(--nw-radius-xl) - 0.35rem);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.025)),
+    rgba(7, 16, 12, 0.34);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 20px 70px rgba(2, 8, 5, 0.22);
+  backdrop-filter: blur(16px);
+}
+
+.nw-hero-eyebrow-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.7rem;
+  margin-bottom: 0.85rem;
 }
 
 .nw-kicker {
-  margin-bottom: 0.85rem;
   color: var(--nw-accent);
   font-size: 0.78rem;
   font-weight: 700;
@@ -171,22 +186,54 @@
   text-transform: uppercase;
 }
 
+.nw-status-badge {
+  display: inline-flex;
+  min-height: 1.7rem;
+  align-items: center;
+  border: 1px solid rgba(157, 230, 186, 0.24);
+  border-radius: 999px;
+  padding: 0 0.7rem;
+  color: rgba(243, 247, 239, 0.84);
+  background: rgba(157, 230, 186, 0.08);
+  font-size: 0.74rem;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+}
+
 .nw-lede {
-  max-width: 42rem;
-  /* Bumped from 1.35rem so the lede always clears the h1's descenders even
-     when the headline wraps to many lines on narrow viewports. */
-  margin-top: clamp(1.5rem, 2.4vw, 2.2rem);
+  max-width: 40rem;
+  margin-top: clamp(1rem, 1.8vw, 1.45rem);
   color: var(--nw-text);
-  font-size: clamp(1rem, 1.8vw, 1.28rem);
+  font-size: clamp(1rem, 1.35vw, 1.14rem);
   line-height: 1.6;
   text-wrap: pretty;
+}
+
+.nw-hero-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-top: 1.25rem;
+}
+
+.nw-hero-metrics span {
+  display: inline-flex;
+  min-height: 2rem;
+  align-items: center;
+  border: 1px solid rgba(222, 231, 224, 0.11);
+  border-radius: 999px;
+  padding: 0 0.75rem;
+  color: rgba(243, 247, 239, 0.72);
+  background: rgba(255, 255, 255, 0.04);
+  font-size: 0.78rem;
+  font-weight: 700;
 }
 
 .nw-hero-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 0.85rem;
-  margin-top: 2rem;
+  margin-top: 1.55rem;
 }
 
 .nw-upload-button,
@@ -203,6 +250,7 @@
   font: inherit;
   font-weight: 800;
   cursor: pointer;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
   transition: transform 180ms ease, background 180ms ease, border-color 180ms ease, opacity 180ms ease;
 }
 
@@ -261,6 +309,12 @@
 .nw-primary-button:hover:not(:disabled),
 .nw-primary-button:focus-visible:not(:disabled) {
   transform: translateY(-2px);
+}
+
+.nw-upload-button:active,
+.nw-primary-button:active:not(:disabled),
+.nw-secondary-button:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
 }
 
 .nw-file-note {
