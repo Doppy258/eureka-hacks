@@ -165,6 +165,11 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     return ((x - mu) / sd).astype(np.float32)
 
 
+def _unit_clip(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Map a raw feature to [0, 1] using fixed absolute thresholds."""
+    return np.clip((x - lo) / (hi - lo + 1e-6), 0.0, 1.0).astype(np.float32)
+
+
 def _frame_entropy(frames: np.ndarray, bins: int = 16) -> np.ndarray:
     """Approximate per-frame grayscale entropy.
 
@@ -237,6 +242,28 @@ def run_fast_surface(
     audio_env = _ffmpeg_extract_audio_envelope(video_path, target_T=T)
     audio_transient = np.concatenate([[0.0], np.abs(np.diff(audio_env))])
 
+    # Absolute salience gate: this is what prevents every clip from looking
+    # "engaged." The spatial pattern below is still normalized so regions are
+    # comparable, but its amplitude is multiplied by these raw video/audio
+    # strengths. Flat, quiet, low-motion clips stay mostly green; high-motion,
+    # high-contrast, audio-transient clips can reach red.
+    visual_salience = (
+        0.18 * _unit_clip(contrast, 0.05, 0.24)
+        + 0.16 * _unit_clip(motion, 0.012, 0.11)
+        + 0.14 * _unit_clip(edge_density, 0.035, 0.16)
+        + 0.12 * _unit_clip(entropy, 0.55, 0.92)
+        + 0.11 * _unit_clip(brightness_flicker, 0.012, 0.095)
+        + 0.10 * _unit_clip(center_motion, 0.010, 0.095)
+        + 0.09 * _unit_clip(np.abs(cs), 0.025, 0.20)
+    )
+    audio_salience = (
+        0.06 * _unit_clip(audio_env, 0.10, 1.10)
+        + 0.04 * _unit_clip(audio_transient, 0.08, 0.75)
+    )
+    salience = np.clip(visual_salience + audio_salience, 0.0, 1.0)
+    if salience.size >= 3:
+        salience = np.convolve(salience, np.asarray([0.2, 0.6, 0.2], dtype=np.float32), mode="same")
+
     # Feature order MUST match REGION_CENTROIDS row order: V1, V2/V3, foveal V1,
     # MT+, lateral V1/V2, dorsal V3, A1.
     feats = np.stack(
@@ -265,10 +292,13 @@ def run_fast_surface(
     with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
         preds = feats @ basis  # (T, V), spatially smooth + anatomically located
 
-    # Per-timestep z-score + clip for the renderer.
+    # Per-timestep z-score creates a comparable regional pattern; then the
+    # absolute salience gate controls whether that pattern is visually strong.
     mu = preds.mean(axis=1, keepdims=True)
     sd = preds.std(axis=1, keepdims=True) + 1e-6
     preds = (preds - mu) / sd
+    gain = (0.12 + 0.95 * np.power(salience, 1.4)).reshape(-1, 1)
+    preds = preds * gain
     preds = np.clip(preds, -3.0, 3.0).astype(np.float32)
 
     # Per-region average z (using the "core" of each Gaussian patch where
@@ -333,14 +363,13 @@ def build_fast_analyze_from_surface(surf: dict[str, Any]) -> dict[str, Any]:
         for r, entry in enumerate(row):
             region_ts[t, r] = float(entry["z"])
 
-    # Engagement = per-timestep mean of |z| across the anatomical regions, then
-    # min-max normalized to roughly [0, 1] so downstream code that treats it as
-    # a "score" gets a sensible range.
+    # Engagement = absolute activation strength on a fixed scale, not min/max
+    # normalized within the clip. That way a flat/low-salience video stays low
+    # instead of always manufacturing a "best moment" at 100%.
     eng = np.abs(region_ts).mean(axis=1)
-    if eng.max() > eng.min():
-        eng_norm = (eng - eng.min()) / (eng.max() - eng.min())
-    else:
-        eng_norm = np.full_like(eng, 0.5)
+    # Fixed absolute calibration: below ~0.18 is quiet, around 0.8 is strong,
+    # and only genuinely high-salience moments approach 1.0.
+    eng_norm = np.clip((eng - 0.18) / 0.85, 0.0, 1.0)
 
     return {
         "mode": "fast",
