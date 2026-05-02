@@ -13,10 +13,11 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from backend.fast_surface import run_fast_pointcloud, run_fast_surface
+from backend.fast_surface import run_fast_analyze, run_fast_pointcloud, run_fast_surface
 from backend.feedback import build_feedback
 from backend.tribe_runner import analyze_video, run_tribe_surface, video_duration_seconds
 
@@ -31,8 +32,11 @@ UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = int(os.environ.get("TRIBE_MAX_UPLOAD_MB", "500")) * 1024 * 1024
 
-# When TRIBE_REAL=1 the upload endpoints run real TRIBE inference (slow on CPU).
-# Default: use the fast, video-driven brain timeline so the UI stays interactive.
+# When TRIBE_REAL=1 the upload endpoints (/api/analyze, /api/brain/*) run real
+# TRIBE v2 inference. On Apple MPS or CPU this takes 15-40+ minutes for a 30s
+# clip (whisperx + text/audio/video extractors + LLaMA regression head), so the
+# default is False: we use the fast video-driven proxy that returns in ~1s and
+# still produces a real-data engagement timeline + cortical surface heatmap.
 TRIBE_REAL = os.environ.get("TRIBE_REAL", "").lower() in ("1", "true", "yes")
 
 app = FastAPI(title="NeuroWatch", version="0.2.0")
@@ -44,6 +48,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Gzip the large brain-surface and mesh JSON payloads (~1MB each). The vertex
+# activations are already zlib-compressed inside the JSON (base64 of zlib bytes),
+# so this only meaningfully shrinks the JSON envelope and the mesh response.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 class AnalyzeResponse(BaseModel):
@@ -106,6 +114,29 @@ class BrainSurfaceTimelineResponse(BaseModel):
     region_activations: list[list[RegionActivation]] = Field(default_factory=list)
 
 
+_HARDCODED_PAYLOAD_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _read_hardcoded_cache(path: Path) -> Optional[dict[str, Any]]:
+    """Return the cached JSON payload for ``path`` (parsed once, kept in memory).
+
+    The hardcoded demo caches are immutable for the life of the process; we only
+    need to parse them on the first request. Caching the parsed dict shaves
+    ~30ms (1MB JSON parse) off every demo load.
+    """
+    if not path.exists():
+        return None
+    key = str(path)
+    cached = _HARDCODED_PAYLOAD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import json
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    _HARDCODED_PAYLOAD_CACHE[key] = payload
+    return payload
+
+
 def _hardcoded_video_path() -> Path:
     explicit = os.environ.get("TRIBE_HARDCODED_VIDEO", "").strip()
     if explicit:
@@ -163,14 +194,8 @@ def hardcoded_brain():
         )
 
     cache_path = UPLOAD_ROOT / "hardcoded_brain_cache.json"
-    if cache_path.exists():
-        try:
-            import json
-
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            raise HTTPException(500, f"Failed to read {cache_path.name}: {e}") from e
-    else:
+    payload = _read_hardcoded_cache(cache_path)
+    if payload is None:
         # Real, video-driven point-cloud fallback (seconds, not hours).
         try:
             payload = run_fast_pointcloud(str(video_path))
@@ -190,6 +215,75 @@ def hardcoded_brain():
     )
 
 
+@app.get("/api/hardcoded/analyze", response_model=AnalyzeResponse)
+def hardcoded_analyze():
+    """Return the precomputed AnalyzeResponse for the bundled demo clip.
+
+    Reads ``backend/uploads/hardcoded_analyze_cache.json`` (produced by
+    ``new-test/tribev2/precompute_hardcoded_surface_cache.py``). If the cache is
+    missing, synthesizes a cheap ``run_demo`` timeline so the studio demo never
+    404s during a live demo.
+    """
+    video_path = _hardcoded_video_path()
+    if not video_path.exists():
+        raise HTTPException(
+            404,
+            f"Hardcoded video not found: {video_path}. Set TRIBE_HARDCODED_VIDEO to an existing path.",
+        )
+
+    cache_path = UPLOAD_ROOT / "hardcoded_analyze_cache.json"
+    payload = _read_hardcoded_cache(cache_path)
+    if payload is None:
+        # No precomputed cache: synthesize a cheap, deterministic demo timeline.
+        logger.warning(
+            "hardcoded_analyze_cache.json missing; falling back to run_demo. "
+            "Run new-test/tribev2/precompute_hardcoded_surface_cache.py to bake real TRIBE output."
+        )
+        from backend.tribe_runner import run_demo
+
+        try:
+            raw_payload = run_demo(str(video_path))
+            raw = _normalize_raw_result(raw_payload)
+            feedback = _build_local_feedback(raw)
+            feedback = _annotate_feedback_source(
+                feedback, inference_source="demo", raw_mode=str(raw["mode"])
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Hardcoded demo synthesis failed: {e}") from e
+
+        payload = {
+            "job_id": "hardcoded-demo",
+            "video_url": "/api/hardcoded/video",
+            "mode": raw["mode"],
+            "video_duration_sec": float(raw["video_duration_sec"]),
+            "tr_sec": float(raw["tr_sec"]),
+            "timestamps_start": [float(x) for x in raw["timestamps_start"]],
+            "timestamps_end": [float(x) for x in raw["timestamps_end"]],
+            "engagement": [float(x) for x in raw["engagement"]],
+            "region_labels": list(raw["region_labels"]),
+            "region_timeseries": [[float(v) for v in row] for row in raw["region_timeseries"]],
+            "inference_source": "demo",
+            "feedback": feedback,
+            "fallback_error": "no precomputed cache; serving synthetic demo",
+        }
+
+    return AnalyzeResponse(
+        job_id=str(payload.get("job_id") or "hardcoded-demo"),
+        video_url=str(payload.get("video_url") or "/api/hardcoded/video"),
+        mode=str(payload["mode"]),
+        video_duration_sec=float(payload["video_duration_sec"]),
+        tr_sec=float(payload["tr_sec"]),
+        timestamps_start=[float(x) for x in payload["timestamps_start"]],
+        timestamps_end=[float(x) for x in payload["timestamps_end"]],
+        engagement=[float(x) for x in payload["engagement"]],
+        region_labels=list(payload["region_labels"]),
+        region_timeseries=[[float(v) for v in row] for row in payload["region_timeseries"]],
+        inference_source=str(payload.get("inference_source") or "local"),
+        feedback=payload.get("feedback"),
+        fallback_error=payload.get("fallback_error"),
+    )
+
+
 @app.get("/api/hardcoded/brain_surface", response_model=BrainSurfaceTimelineResponse)
 def hardcoded_brain_surface():
     video_path = _hardcoded_video_path()
@@ -200,14 +294,8 @@ def hardcoded_brain_surface():
         )
 
     cache_path = UPLOAD_ROOT / "hardcoded_surface_cache.json"
-    if cache_path.exists():
-        try:
-            import json
-
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except Exception as e:
-            raise HTTPException(500, f"Failed to read {cache_path.name}: {e}") from e
-    else:
+    payload = _read_hardcoded_cache(cache_path)
+    if payload is None:
         # No precomputed TRIBE cache: derive a real, video-driven surface in seconds via fast mode.
         # This matches what the upload endpoints do by default and avoids the 30-60min V-JEPA
         # cold-cache pass on CPU/MPS.
@@ -240,6 +328,9 @@ MESH_ROOT.mkdir(parents=True, exist_ok=True)
 FSAVERAGE5_MESH_PATH = MESH_ROOT / "fsaverage5_mesh.json"
 
 
+_FSAVERAGE5_MESH_CACHE: dict[str, Any] | None = None
+
+
 @app.get("/api/brain/surface/fsaverage5")
 def get_fsaverage5_mesh():
     """Serve a pre-exported fsaverage5 cortical surface mesh (both hemispheres).
@@ -247,20 +338,27 @@ def get_fsaverage5_mesh():
     This endpoint is intentionally static and cacheable. Generate the file once via:
       python backend/scripts/export_fsaverage5_mesh.py
     """
+    global _FSAVERAGE5_MESH_CACHE
     if not FSAVERAGE5_MESH_PATH.exists():
         raise HTTPException(
             404,
             "Missing fsaverage5 mesh. Run `python backend/scripts/export_fsaverage5_mesh.py` "
             "to generate backend/static/fsaverage5_mesh.json.",
         )
-    try:
-        import json
+    if _FSAVERAGE5_MESH_CACHE is None:
+        try:
+            import json
 
-        payload = json.loads(FSAVERAGE5_MESH_PATH.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise HTTPException(500, f"Failed to read fsaverage5 mesh JSON: {e}") from e
+            _FSAVERAGE5_MESH_CACHE = json.loads(
+                FSAVERAGE5_MESH_PATH.read_text(encoding="utf-8")
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Failed to read fsaverage5 mesh JSON: {e}") from e
     # Let the browser cache aggressively in dev too; the mesh is immutable.
-    return JSONResponse(payload, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    return JSONResponse(
+        _FSAVERAGE5_MESH_CACHE,
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @app.post("/api/brain/surface_timeline", response_model=BrainSurfaceTimelineResponse)
@@ -314,6 +412,11 @@ async def brain_surface_timeline(file: UploadFile = File(...)):
         # Keep the uploaded file so retries can hit caches.
         raise HTTPException(500, f"Brain surface inference failed: {e}") from e
 
+    raw_regions = raw.get("region_activations") or []
+    region_activations = [
+        [RegionActivation(name=str(r["name"]), z=float(r["z"])) for r in row]
+        for row in raw_regions
+    ]
     return BrainSurfaceTimelineResponse(
         job_id=digest,
         video_url=f"/api/video/{digest}",
@@ -325,6 +428,7 @@ async def brain_surface_timeline(file: UploadFile = File(...)):
         vertex_count=int(raw["vertex_count"]),
         mesh=SurfaceMeshRef(url="/api/brain/surface/fsaverage5"),
         activations=EncodedFloatArray(**raw["activations"]),
+        region_activations=region_activations,
     )
 
 
@@ -553,6 +657,8 @@ def _annotate_feedback_source(
             report["mode_label"] = "remote TRIBE v2" if raw_mode == "tribe" else "remote demo-safe proxy"
         elif inference_source == "demo":
             report["mode_label"] = "demo-safe proxy"
+        elif inference_source == "fast":
+            report["mode_label"] = "fast video-driven proxy"
         else:
             report["mode_label"] = "local TRIBE v2" if raw_mode == "tribe" else "demo-safe proxy"
     return feedback
@@ -610,12 +716,19 @@ async def analyze(
                 elif "creator_report" not in fb:
                     fb["creator_report"] = local_fb["creator_report"]
         else:
-            raw = _normalize_raw_result(analyze_video(str(dest)))
+            # Default: derive engagement from real video features in ~1s. Real
+            # TRIBE inference (15-40min on Apple MPS for a ~30s clip) is opt-in
+            # via ``TRIBE_REAL=1`` so the upload path stays interactive.
+            if TRIBE_REAL:
+                raw = _normalize_raw_result(analyze_video(str(dest)))
+                if raw.get("mode") == "demo":
+                    inference_source = "demo"
+            else:
+                raw = _normalize_raw_result(run_fast_analyze(str(dest)))
+                inference_source = "fast"
             fb = None
             if include_feedback:
                 fb = _build_local_feedback(raw)
-            if raw.get("mode") == "demo":
-                inference_source = "demo"
         if not 10 <= float(raw["video_duration_sec"]) <= 90:
             dest.unlink(missing_ok=True)
             raise HTTPException(400, "NeuroWatch MVP supports videos from 10 to 90 seconds.")

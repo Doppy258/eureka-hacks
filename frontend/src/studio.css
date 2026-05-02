@@ -61,7 +61,14 @@
 .studio-root h1 {
   max-width: 10ch;
   font-size: clamp(3.75rem, 10vw, 8.5rem);
-  line-height: 0.84;
+  /* line-height was 0.84, which clipped descenders ("g", "p", "y") into the
+     paragraph below at this font size. 0.95 keeps the tight editorial feel
+     while leaving room for descenders inside the line box. */
+  line-height: 0.95;
+  /* Reserve space for descender overhang so the rendered glyphs never bleed
+     into the next sibling's margin even when text-wrap balance pushes long
+     lines into the bottom row. */
+  padding-bottom: 0.12em;
 }
 
 .studio-root h2 {
@@ -166,7 +173,9 @@
 
 .nw-lede {
   max-width: 42rem;
-  margin-top: 1.35rem;
+  /* Bumped from 1.35rem so the lede always clears the h1's descenders even
+     when the headline wraps to many lines on narrow viewports. */
+  margin-top: clamp(1.5rem, 2.4vw, 2.2rem);
   color: var(--nw-text);
   font-size: clamp(1rem, 1.8vw, 1.28rem);
   line-height: 1.6;
@@ -181,7 +190,8 @@
 }
 
 .nw-upload-button,
-.nw-primary-button {
+.nw-primary-button,
+.nw-secondary-button {
   display: inline-flex;
   min-height: 3.25rem;
   align-items: center;
@@ -194,6 +204,24 @@
   font-weight: 800;
   cursor: pointer;
   transition: transform 180ms ease, background 180ms ease, border-color 180ms ease, opacity 180ms ease;
+}
+
+.nw-secondary-button {
+  border: 1px solid rgba(222, 231, 224, 0.18);
+  color: var(--nw-ink);
+  background: rgba(255, 255, 255, 0.04);
+  font-weight: 700;
+}
+
+.nw-secondary-button:hover:not(:disabled),
+.nw-secondary-button:focus-visible:not(:disabled) {
+  transform: translateY(-2px);
+  border-color: rgba(157, 230, 186, 0.45);
+}
+
+.nw-secondary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .nw-upload-button {
@@ -300,6 +328,59 @@
     radial-gradient(circle at 38% 34%, rgba(157, 230, 186, 0.12), transparent 9rem),
     rgba(255, 255, 255, 0.04);
   box-shadow: inset 0 0 0 1px rgba(157, 230, 186, 0.14), inset 0 0 60px rgba(157, 230, 186, 0.08);
+}
+
+.nw-brain-3d {
+  position: relative;
+  margin: 1rem 0 0.6rem;
+  height: clamp(20rem, 32vh, 24rem);
+  border-radius: var(--nw-radius-lg);
+  border: 1px solid rgba(157, 230, 186, 0.18);
+  background: radial-gradient(circle at 48% 38%, rgba(157, 230, 186, 0.12), transparent 12rem), rgba(7, 16, 12, 1);
+  overflow: hidden;
+}
+
+.nw-region-caption {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.85rem;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.65rem;
+  border-radius: var(--nw-radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.nw-region-up {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.25rem;
+  color: #fbbf77;
+}
+
+.nw-region-down {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.25rem;
+  color: #7fb6ff;
+}
+
+.nw-region-z {
+  opacity: 0.55;
+  font-weight: 500;
+}
+
+.nw-region-error {
+  margin-top: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--nw-radius-sm);
+  border: 1px solid rgba(244, 109, 117, 0.35);
+  background: rgba(244, 109, 117, 0.1);
+  color: #f7c4c8;
+  font-size: 0.78rem;
 }
 
 .nw-brain-orb span {
