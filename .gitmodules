@@ -1,0 +1,3 @@
+[submodule "new-test/tribev2"]
+	path = new-test/tribev2
+	url = https://github.com/facebookresearch/tribev2.git
