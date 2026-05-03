@@ -33,7 +33,10 @@ async function inflateZlib(bytes: Uint8Array): Promise<Uint8Array> {
   const DS = (globalThis as any).DecompressionStream as undefined | (new (format: string) => DecompressionStream)
   if (!DS) throw new Error('DecompressionStream not available in this browser.')
   const ds = new DS('deflate')
-  const stream = new Response(bytes).body
+  // Copy into a fresh Uint8Array so `buffer` is a plain ArrayBuffer (BodyInit typing).
+  const bodyCopy = new Uint8Array(bytes.byteLength)
+  bodyCopy.set(bytes)
+  const stream = new Response(bodyCopy.buffer).body
   if (!stream) throw new Error('Failed to create decompression stream.')
   const decompressed = stream.pipeThrough(ds)
   const buf = await new Response(decompressed).arrayBuffer()
