@@ -106,6 +106,11 @@ type BrainSurfaceTimelineResponse = {
   region_activations?: RegionActivation[][]
 }
 
+type AnalyzeFastBundleResponse = {
+  analyze: AnalyzeResponse
+  surface: BrainSurfaceTimelineResponse
+}
+
 type SurfaceState = {
   timeline: BrainSurfaceTimelineResponse
   mesh: SurfaceMeshJson
@@ -212,6 +217,16 @@ function apiErrorMessage(body: string, fallback: string): string {
     return body
   }
   return body
+}
+
+class ApiRequestError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+  }
 }
 
 function scoreTone(score: number): string {
@@ -364,10 +379,10 @@ export default function StudioApp() {
     })
   }, [report])
 
-  // Map the current playhead -> active surface timestep via binary search over
-  // timestamps_start. Mirrors the BrainTimelineViewer behavior so the brain
-  // updates as the source clip plays.
-  const surfaceTimestep = useMemo(() => {
+  // Map the current playhead -> fractional surface frame. The renderer blends
+  // adjacent activation frames, so playback feels continuous instead of snapping
+  // from heatmap keyframe to heatmap keyframe.
+  const surfaceFrame = useMemo(() => {
     if (!surface) return 0
     const starts = surface.timeline.timestamps_start
     if (!starts.length) return 0
@@ -383,8 +398,13 @@ export default function StudioApp() {
         hi = mid - 1
       }
     }
-    return best
+    const next = Math.min(starts.length - 1, best + 1)
+    if (next === best) return best
+    const span = Math.max(1e-6, starts[next] - starts[best])
+    return best + Math.max(0, Math.min(1, (playhead - starts[best]) / span))
   }, [surface, playhead])
+
+  const surfaceTimestep = Math.floor(surfaceFrame)
 
   const topRegions = useMemo(() => {
     if (!surface?.timeline.region_activations) return null
@@ -447,6 +467,46 @@ export default function StudioApp() {
     video.play().catch(() => {})
   }, [])
 
+  useEffect(() => {
+    const video = videoRef.current
+    if (!videoSrc || !video) return
+
+    let raf = 0
+    const updatePlayhead = () => {
+      const next = video.currentTime
+      setPlayhead((prev) => (Math.abs(prev - next) < 0.01 ? prev : next))
+    }
+    const tick = () => {
+      updatePlayhead()
+      raf = window.requestAnimationFrame(tick)
+    }
+    const start = () => {
+      if (raf) window.cancelAnimationFrame(raf)
+      raf = window.requestAnimationFrame(tick)
+    }
+    const stop = () => {
+      if (raf) {
+        window.cancelAnimationFrame(raf)
+        raf = 0
+      }
+      updatePlayhead()
+    }
+
+    video.addEventListener('play', start)
+    video.addEventListener('pause', stop)
+    video.addEventListener('seeked', stop)
+    video.addEventListener('loadedmetadata', stop)
+    if (!video.paused) start()
+
+    return () => {
+      if (raf) window.cancelAnimationFrame(raf)
+      video.removeEventListener('play', start)
+      video.removeEventListener('pause', stop)
+      video.removeEventListener('seeked', stop)
+      video.removeEventListener('loadedmetadata', stop)
+    }
+  }, [videoSrc])
+
   const analyze = async () => {
     if (!file) {
       setError('Choose a video first.')
@@ -461,59 +521,75 @@ export default function StudioApp() {
     setSurface(null)
     setUsingDemo(false)
 
-    const postWithProgress = <T,>(url: string): Promise<T> =>
+    const postWithProgress = <T,>(url: string, progressStart = 0, progressSpan = 100): Promise<T> =>
       new Promise<T>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
+        let progressTimer: number | undefined
+        const clearProgressTimer = () => {
+          if (progressTimer !== undefined) {
+            window.clearInterval(progressTimer)
+            progressTimer = undefined
+          }
+        }
         xhr.open('POST', url)
         xhr.upload.onprogress = (event) => {
           if (event.lengthComputable) {
-            setUploadProgress(Math.round((event.loaded / event.total) * 100))
+            const requestProgress = event.loaded / event.total
+            // Upload is only the first part of the fast bundle. Keep room in
+            // the bar for the real feature extraction + heatmap projection that
+            // happens after the bytes reach FastAPI.
+            setUploadProgress(Math.round(progressStart + requestProgress * progressSpan * 0.35))
           }
         }
+        xhr.upload.onload = () => {
+          let nextProgress = progressStart + progressSpan * 0.35
+          progressTimer = window.setInterval(() => {
+            nextProgress = Math.min(progressStart + progressSpan * 0.92, nextProgress + progressSpan * 0.025)
+            setUploadProgress(Math.round(nextProgress))
+          }, 140)
+        }
         xhr.onload = () => {
+          clearProgressTimer()
           if (xhr.status >= 200 && xhr.status < 300) {
             resolve(JSON.parse(xhr.responseText) as T)
             return
           }
-          reject(new Error(apiErrorMessage(xhr.responseText, xhr.statusText)))
+          reject(new ApiRequestError(apiErrorMessage(xhr.responseText, xhr.statusText), xhr.status))
         }
-        xhr.onerror = () => reject(new Error('Connection failed. Is the FastAPI backend running on port 8000?'))
+        xhr.onerror = () => {
+          clearProgressTimer()
+          reject(new Error('Connection failed. Is the FastAPI backend running on port 8000?'))
+        }
         const formData = new FormData()
         formData.append('file', file)
         xhr.send(formData)
       })
 
     try {
-      // Run the heavy report and the brain-surface fetch in parallel; the
-      // surface route uses the fast video-driven proxy (~seconds) so it almost
-      // always finishes before the report.
-      const [analyzeRes, surfaceRes] = await Promise.allSettled([
-        postWithProgress<AnalyzeResponse>('/api/analyze?include_feedback=true'),
-        postWithProgress<BrainSurfaceTimelineResponse>('/api/brain/surface_timeline'),
-      ])
+      let bundle: AnalyzeFastBundleResponse
+      try {
+        bundle = await postWithProgress<AnalyzeFastBundleResponse>('/api/analyze/fast_bundle?include_feedback=true')
+      } catch (err) {
+        if (!(err instanceof ApiRequestError) || err.status !== 404) {
+          throw err
+        }
 
-      if (analyzeRes.status === 'fulfilled') {
-        setResult(analyzeRes.value)
-      } else {
-        throw analyzeRes.reason instanceof Error
-          ? analyzeRes.reason
-          : new Error(String(analyzeRes.reason))
+        // Compatibility fallback for a stale dev backend that has not been
+        // restarted with /api/analyze/fast_bundle yet. In the current FastAPI
+        // app, /api/analyze defaults to the fast proxy unless TRIBE_REAL=1.
+        const analyzeResult = await postWithProgress<AnalyzeResponse>('/api/analyze?include_feedback=true', 0, 50)
+        const surfaceTimeline = await postWithProgress<BrainSurfaceTimelineResponse>('/api/brain/surface_timeline', 50, 50)
+        bundle = { analyze: analyzeResult, surface: surfaceTimeline }
       }
 
-      if (surfaceRes.status === 'fulfilled') {
-        try {
-          const next = await fetchSurfaceFromTimeline(surfaceRes.value)
-          setSurface(next)
-        } catch (e) {
-          setSurfaceError(e instanceof Error ? e.message : 'Failed to load brain surface mesh.')
-          setSurface(null)
-        }
-      } else {
-        setSurfaceError(
-          surfaceRes.reason instanceof Error
-            ? surfaceRes.reason.message
-            : String(surfaceRes.reason),
-        )
+      setResult(bundle.analyze)
+
+      try {
+        const next = await fetchSurfaceFromTimeline(bundle.surface)
+        setSurface(next)
+      } catch (e) {
+        setSurfaceError(e instanceof Error ? e.message : 'Failed to load brain surface mesh.')
+        setSurface(null)
       }
 
       setUploadProgress(100)
@@ -540,14 +616,22 @@ export default function StudioApp() {
         </nav>
 
         <div className="nw-hero-grid">
-          <div>
-            <p className="nw-kicker">pre-upload brain-response debugger</p>
-            <h1>See where your content wakes the brain up, and where it goes stale.</h1>
+          <div className="nw-hero-copy">
+            <div className="nw-hero-eyebrow-row">
+              <p className="nw-kicker">pre-upload brain-response debugger</p>
+              <span className="nw-status-badge">fast cortical proxy</span>
+            </div>
+            <h1>Brain-response heatmaps before you post.</h1>
             <p className="nw-lede">
               {usingDemo
-                ? 'Demo clip pre-loaded. Press play and watch the brain respond — then upload your own video to compare.'
-                : 'Upload a short video and get a creator report: hook score, stale sections, top moments, a suggested 15-second cut, and timestamped edit notes.'}
+                ? 'A demo clip is loaded with predicted cortical activity, region shifts, stale sections, and timestamped edit notes ready to inspect.'
+                : 'Upload a short clip to turn pixels and sound into a fast cortical proxy timeline, hook risk, stale sections, and a suggested cut.'}
             </p>
+            <div className="nw-hero-metrics" aria-label="NeuroWatch analysis outputs">
+              <span>3D cortical surface</span>
+              <span>second-by-second timeline</span>
+              <span>timestamped edit plan</span>
+            </div>
             <div className="nw-hero-actions">
               <label className="nw-upload-button">
                 <Upload size={18} />
@@ -578,14 +662,14 @@ export default function StudioApp() {
             </div>
             <p className="nw-file-note">
               {usingDemo
-                ? 'Showing the bundled IMG_2225 demo (precomputed). MVP supports .mp4, .mov, and .webm clips from 10 to 90 seconds.'
-                : 'MVP supports .mp4, .mov, and .webm clips from 10 to 90 seconds.'}
+                ? 'Showing the bundled IMG_2225 demo (precomputed). Uploads use the fast cortical proxy; MVP supports .mp4, .mov, and .webm clips from 10 to 90 seconds.'
+                : 'Uploads use the fast cortical proxy, not local TRIBE v2. Supports .mp4, .mov, and .webm clips from 10 to 90 seconds.'}
             </p>
           </div>
 
           <DemoBrain
             surface={surface}
-            timestep={surfaceTimestep}
+            timestep={surfaceFrame}
             topRegions={topRegions}
             fallbackCells={brainCells}
             score={report?.overall_score ?? 42}
@@ -899,7 +983,7 @@ function ProcessingState({ progress }: { progress: number }) {
     <section className="nw-processing" aria-live="polite">
       <div>
         <p className="nw-kicker">processing</p>
-        <h2>Extracting frames, audio, and predicted response</h2>
+        <h2>Extracting visual rhythm, audio transients, and cortical heatmap</h2>
       </div>
       <div className="nw-progress-track">
         <span style={{ width: `${Math.max(progress, 8)}%` }} />

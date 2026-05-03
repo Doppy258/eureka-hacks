@@ -6,6 +6,9 @@ import logging
 import os
 import uuid
 import hashlib
+import json
+import asyncio
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -17,7 +20,12 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from backend.fast_surface import run_fast_analyze, run_fast_pointcloud, run_fast_surface
+from backend.fast_surface import (
+    build_fast_analyze_from_surface,
+    run_fast_analyze,
+    run_fast_pointcloud,
+    run_fast_surface,
+)
 from backend.feedback import build_feedback
 from backend.tribe_runner import analyze_video, run_tribe_surface, video_duration_seconds
 
@@ -31,6 +39,9 @@ UPLOAD_ROOT = Path(os.environ.get("TRIBE_UPLOAD_DIR", Path(__file__).resolve().p
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_BYTES = int(os.environ.get("TRIBE_MAX_UPLOAD_MB", "500")) * 1024 * 1024
+SUPPORTED_VIDEO_SUFFIXES = {".mp4", ".webm", ".mov"}
+MVP_DURATION_ERROR = "NeuroWatch MVP supports videos from 10 to 90 seconds."
+FAST_BUNDLE_MIN_SECONDS = float(os.environ.get("FAST_BUNDLE_MIN_SECONDS", "4.0"))
 
 # When TRIBE_REAL=1 the upload endpoints (/api/analyze, /api/brain/*) run real
 # TRIBE v2 inference. On Apple MPS or CPU this takes 15-40+ minutes for a 30s
@@ -114,6 +125,11 @@ class BrainSurfaceTimelineResponse(BaseModel):
     region_activations: list[list[RegionActivation]] = Field(default_factory=list)
 
 
+class AnalyzeFastBundleResponse(BaseModel):
+    analyze: AnalyzeResponse
+    surface: BrainSurfaceTimelineResponse
+
+
 _HARDCODED_PAYLOAD_CACHE: dict[str, dict[str, Any]] = {}
 
 
@@ -130,7 +146,6 @@ def _read_hardcoded_cache(path: Path) -> Optional[dict[str, Any]]:
     cached = _HARDCODED_PAYLOAD_CACHE.get(key)
     if cached is not None:
         return cached
-    import json
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     _HARDCODED_PAYLOAD_CACHE[key] = payload
@@ -358,6 +373,78 @@ def get_fsaverage5_mesh():
     return JSONResponse(
         _FSAVERAGE5_MESH_CACHE,
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+def _video_suffix_or_400(filename: str | None) -> str:
+    if not filename:
+        raise HTTPException(400, "Missing filename")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_VIDEO_SUFFIXES:
+        raise HTTPException(400, "Unsupported video type; upload an mp4, mov, or webm.")
+    return suffix
+
+
+async def _save_content_addressed_upload(file: UploadFile, suffix: str) -> tuple[str, Path, int]:
+    tmp_id = str(uuid.uuid4())
+    tmp_path = UPLOAD_ROOT / f".tmp-{tmp_id}{suffix}"
+
+    size = 0
+    h = hashlib.sha256()
+    try:
+        with tmp_path.open("wb") as buf:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"File too large (max {MAX_UPLOAD_BYTES // (1024*1024)} MB).")
+                h.update(chunk)
+                buf.write(chunk)
+    except HTTPException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    digest = h.hexdigest()
+    dest = UPLOAD_ROOT / f"{digest}{suffix}"
+    if dest.exists():
+        tmp_path.unlink(missing_ok=True)
+    else:
+        tmp_path.replace(dest)
+    return digest, dest, size
+
+
+def _enforce_mvp_duration_or_400(dest: Path) -> None:
+    probed_duration = video_duration_seconds(str(dest))
+    if probed_duration is not None and not 10 <= probed_duration <= 90:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, MVP_DURATION_ERROR)
+
+
+def _surface_response_from_raw(
+    raw: dict[str, Any],
+    *,
+    job_id: str,
+    video_url: str,
+) -> BrainSurfaceTimelineResponse:
+    raw_regions = raw.get("region_activations") or []
+    region_activations = [
+        [RegionActivation(name=str(r["name"]), z=float(r["z"])) for r in row]
+        for row in raw_regions
+    ]
+    return BrainSurfaceTimelineResponse(
+        job_id=job_id,
+        video_url=video_url,
+        mode=str(raw["mode"]),
+        video_duration_sec=float(raw["video_duration_sec"]),
+        tr_sec=float(raw["tr_sec"]),
+        timestamps_start=[float(x) for x in raw["timestamps_start"]],
+        timestamps_end=[float(x) for x in raw["timestamps_end"]],
+        vertex_count=int(raw["vertex_count"]),
+        mesh=SurfaceMeshRef(url="/api/brain/surface/fsaverage5"),
+        activations=EncodedFloatArray(**raw["activations"]),
+        region_activations=region_activations,
     )
 
 
@@ -662,6 +749,67 @@ def _annotate_feedback_source(
         else:
             report["mode_label"] = "local TRIBE v2" if raw_mode == "tribe" else "demo-safe proxy"
     return feedback
+
+
+@app.post("/api/analyze/fast_bundle", response_model=AnalyzeFastBundleResponse)
+async def analyze_fast_bundle(
+    file: UploadFile = File(...),
+    include_feedback: bool = Query(True),
+):
+    """Upload once and return both fast creator analysis and surface timeline.
+
+    This endpoint is intentionally fast-only. It uses general video/audio
+    features as a cortical proxy and never invokes local or remote TRIBE v2.
+    """
+    request_started = time.perf_counter()
+    suffix = _video_suffix_or_400(file.filename)
+    job_id, dest, size = await _save_content_addressed_upload(file, suffix)
+    video_url = f"/api/video/{job_id}"
+    logger.info("Saved fast bundle upload job=%s path=%s bytes=%s", job_id, dest, size)
+
+    _enforce_mvp_duration_or_400(dest)
+
+    try:
+        surface_raw = run_fast_surface(str(dest))
+        raw = _normalize_raw_result(build_fast_analyze_from_surface(surface_raw))
+        if not 10 <= float(raw["video_duration_sec"]) <= 90:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, MVP_DURATION_ERROR)
+
+        feedback = _build_local_feedback(raw) if include_feedback else None
+        feedback = _annotate_feedback_source(feedback, inference_source="fast", raw_mode=str(raw["mode"]))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Fast bundle inference failed")
+        raise HTTPException(500, f"Fast bundle inference failed: {e}") from e
+
+    # Keep the upload experience from feeling like fake/random data when the
+    # proxy finishes very quickly on short clips. The actual feature extraction
+    # above is still real work; this just enforces a small, configurable floor
+    # for demo pacing. Set FAST_BUNDLE_MIN_SECONDS=0 to disable.
+    remaining = FAST_BUNDLE_MIN_SECONDS - (time.perf_counter() - request_started)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+    return AnalyzeFastBundleResponse(
+        analyze=AnalyzeResponse(
+            job_id=job_id,
+            video_url=video_url,
+            mode=raw["mode"],
+            video_duration_sec=float(raw["video_duration_sec"]),
+            tr_sec=float(raw["tr_sec"]),
+            timestamps_start=[float(x) for x in raw["timestamps_start"]],
+            timestamps_end=[float(x) for x in raw["timestamps_end"]],
+            engagement=[float(x) for x in raw["engagement"]],
+            region_labels=list(raw["region_labels"]),
+            region_timeseries=[[float(v) for v in row] for row in raw["region_timeseries"]],
+            inference_source="fast",
+            feedback=feedback,
+            fallback_error=raw.get("fallback_error"),
+        ),
+        surface=_surface_response_from_raw(surface_raw, job_id=job_id, video_url=video_url),
+    )
 
 
 @app.post("/api/analyze", response_model=AnalyzeResponse)

@@ -53,10 +53,19 @@ def _fmt_range(a: float, b: float) -> str:
 def _normalize_0_100(values: np.ndarray) -> np.ndarray:
     if values.size == 0:
         return np.asarray([], dtype=np.float64)
+
+    # Fast-proxy engagement is already an absolute 0..1-ish salience score from
+    # backend.fast_surface.build_fast_analyze_from_surface. Do NOT min/max it
+    # within each clip, or a bad/flat video still manufactures a 100-point peak.
+    if float(np.min(values)) >= 0.0 and float(np.max(values)) <= 1.5:
+        return np.clip(values * 100.0, 0.0, 100.0)
+
     lo = float(np.min(values))
     hi = float(np.max(values))
     if hi <= lo:
-        return np.full(values.shape, 50.0, dtype=np.float64)
+        # A perfectly flat non-fast signal should read as low confidence, not a
+        # fake middle score.
+        return np.zeros(values.shape, dtype=np.float64)
     return np.clip(((values - lo) / (hi - lo)) * 100.0, 0.0, 100.0)
 
 
@@ -99,8 +108,14 @@ def _find_stale_segments(
 ) -> list[dict[str, tp.Any]]:
     if engagement.size == 0:
         return []
-    threshold = float(np.mean(engagement) - 0.5 * np.std(engagement))
-    mask = engagement < threshold
+    if float(np.min(engagement)) >= 0.0 and float(np.max(engagement)) <= 1.5:
+        # For fast-proxy scores, use an absolute stale threshold. This is what
+        # lets a genuinely weak video be mostly stale instead of merely "lower
+        # than its own tiny baseline."
+        mask = normalized < 35.0
+    else:
+        threshold = float(np.mean(engagement) - 0.5 * np.std(engagement))
+        mask = engagement < threshold
     runs = _merge_boolean_runs(mask, starts, ends, MIN_STALE_SECONDS)
     out: list[dict[str, tp.Any]] = []
     for run in runs:
@@ -128,6 +143,50 @@ def _window_score(
     if not np.any(mask):
         return 0.0
     return float(np.mean(normalized[mask]))
+
+
+def _overall_creator_score(
+    engagement: np.ndarray,
+    normalized: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    video_duration_sec: float,
+) -> float:
+    if normalized.size == 0:
+        return 0.0
+
+    # Fast-proxy values are absolute 0..1-ish salience. Score these
+    # conservatively: a constant noisy/loud clip should not get a 95 just
+    # because every frame is stimulated. Reward peak strength, hook strength,
+    # and variation over time; penalize flat high stimulation.
+    is_fast_proxy = float(np.min(engagement)) >= 0.0 and float(np.max(engagement)) <= 1.5
+    if not is_fast_proxy:
+        return round(float(np.mean(normalized)), 1)
+
+    mean_score = float(np.mean(normalized))
+    p90_score = float(np.percentile(normalized, 90))
+    hook_score = _window_score(normalized, starts, ends, 0.0, min(3.0, video_duration_sec))
+    variation = float(np.std(normalized))
+    variation_score = float(np.clip(variation * 2.2, 0.0, 100.0))
+
+    base = (
+        0.34 * p90_score
+        + 0.24 * hook_score
+        + 0.18 * mean_score
+        + 0.24 * variation_score
+    )
+
+    # If the signal is flat, it may be loud/noisy, but it is not an engaging
+    # edit curve. Good creator clips should have contrast: attention spikes,
+    # resets, pattern interrupts, and quieter connective tissue.
+    structure_multiplier = 0.35 + 0.65 * float(np.clip(variation / 32.0, 0.0, 1.0))
+    score = base * structure_multiplier
+
+    # Very low mean salience should stay low even if one frame jitters.
+    if mean_score < 22.0:
+        score *= mean_score / 22.0
+
+    return round(float(np.clip(score, 0.0, 100.0)), 1)
 
 
 def _find_peak_segments(
@@ -196,7 +255,7 @@ def _build_creator_report(
     demo_mode: bool,
 ) -> dict[str, tp.Any]:
     normalized = _normalize_0_100(engagement)
-    overall_score = round(float(np.mean(normalized)), 1) if normalized.size else 0.0
+    overall_score = _overall_creator_score(engagement, normalized, starts, ends, video_duration_sec)
     hook_score = round(_window_score(normalized, starts, ends, 0.0, min(3.0, video_duration_sec)), 1)
     stale_segments = _find_stale_segments(engagement, normalized, starts, ends)
     peak_segments = _find_peak_segments(normalized, starts, ends, video_duration_sec)
